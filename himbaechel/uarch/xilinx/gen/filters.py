@@ -81,10 +81,8 @@ def include_pip(tile_type, p):
         return False
     if "CLK_HROW_CK_INT" in p.src_wire().name():
         return False
-    if tile_type.startswith("HCLK_CMT") and "FREQ_REF" in p.dst_wire().name():
-        return False
-    if tile_type.startswith("CMT_TOP_L_LOWER"):
-        return False
+    # if tile_type.startswith("HCLK_CMT") and "FREQ_REF" in p.dst_wire().name():
+    #     return False
     if tile_type.startswith("CLK_HROW_TOP"):
         if "CK_BUFG_CASCO" in p.dst_wire().name() and "CK_BUFG_CASCIN" in p.src_wire().name():
             return False
@@ -106,3 +104,7 @@ def include_pip(tile_type, p):
         if "MMCM_CLK_FREQ_BB" in p.dst_wire().name():
             return False
     return True
+
+def is_global_bel(bel):
+    bt = bel.bel_type()
+    return bt in ("BUFGCTRL_BUFGCTRL", "BUFG_BUFG")

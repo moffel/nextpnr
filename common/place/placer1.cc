@@ -31,6 +31,7 @@
 #include <limits>
 #include <list>
 #include <map>
+#include <mutex>
 #include <ostream>
 #include <queue>
 #include <set>
@@ -42,7 +43,6 @@
 #include "fast_bels.h"
 #include "log.h"
 #include "place_common.h"
-#include "scope_lock.h"
 #include "timing.h"
 #include "util.h"
 
@@ -138,7 +138,7 @@ class SAPlacer
     {
         log_break();
 
-        ScopeLock<Context> lock(ctx);
+        std::lock_guard<Context> lock{*ctx};
 
         size_t placed_cells = 0;
         std::vector<CellInfo *> autoplaced;
@@ -1238,7 +1238,6 @@ Placer1Cfg::Placer1Cfg(Context *ctx)
     startTemp = ctx->setting<float>("placer1/startTemp", 1);
     timingFanoutThresh = std::numeric_limits<int>::max();
     timing_driven = ctx->setting<bool>("timing_driven");
-    slack_redist_iter = ctx->setting<int>("slack_redist_iter");
     hpwl_scale_x = 1;
     hpwl_scale_y = 1;
 }

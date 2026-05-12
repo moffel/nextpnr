@@ -19,11 +19,11 @@
 
 #include <chrono>
 #include <cmath>
+#include <mutex>
 #include <queue>
 
 #include "log.h"
 #include "router1.h"
-#include "scope_lock.h"
 #include "timing.h"
 
 namespace {
@@ -1163,7 +1163,7 @@ bool router1(Context *ctx, const Router1Cfg &cfg)
     try {
         log_break();
         log_info("Routing..\n");
-        ScopeLock<Context> lock(ctx);
+        std::lock_guard<Context> lock{*ctx};
         auto rstart = std::chrono::high_resolution_clock::now();
 
         log_info("Setting up routing queue.\n");

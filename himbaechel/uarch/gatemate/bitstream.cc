@@ -65,10 +65,12 @@ struct BitstreamBackend
 
         WireId cursor = dst_wire;
         bool invert = false;
-        if (net_info->driver.cell && net_info->driver.cell->type == id_CPE_BRIDGE &&
-            net_info->driver.port == id_MUXOUT) {
-            int val = int_or_default(net_info->driver.cell->params, id_C_SN, 0) + 1;
-            invert ^= need_inversion(net_info->driver.cell, ctx->idf("IN%d", val));
+        if (net_info->driver.cell && uarch->pass_backtrace.count(net_info->driver.cell->name)) {
+            auto &bt = uarch->pass_backtrace[net_info->driver.cell->name];
+            if (bt.count(net_info->driver.port)) {
+                IdString src_port = bt[net_info->driver.port];
+                invert ^= need_inversion(net_info->driver.cell, src_port);
+            }
         }
         while (cursor != WireId() && cursor != src_wire) {
             auto it = net_info->wires.find(cursor);
@@ -243,10 +245,10 @@ struct BitstreamBackend
         NPNR_ASSERT(!(all_correct && all_inverted) && "net doesn't drive any ports?");
 
         if (!all_correct && !all_inverted) {
-            log_warning("multiplier net '%s' has inconsistent inversion\n", net->name.c_str(ctx));
+            log_warning("Multiplier net '%s' has inconsistent inversion.\n", net->name.c_str(ctx));
 
             auto driver_loc = ctx->getBelLocation(net->driver.cell->bel);
-            log_warning("net is driven from (%d, %d)\n", driver_loc.x, driver_loc.y);
+            log_warning("Net is driven from (%d, %d)\n", driver_loc.x, driver_loc.y);
 
             log_warning("  these ports are not inverted:\n");
             for (PortRef user : net->users) {
@@ -272,7 +274,7 @@ struct BitstreamBackend
         } else if (all_inverted) {
             params[id_INIT_L10] = Property(~driver_l10 & 0b1111, 4);
             if (ctx->debug)
-                log_info("multiplier net '%s': fixed inversion\n", net->name.c_str(ctx));
+                log_info("Multiplier net '%s': fixed inversion.\n", net->name.c_str(ctx));
         }
     }
 
@@ -341,14 +343,25 @@ struct BitstreamBackend
                 if (l.z == CPE_LT_FULL_Z) {
                     if (!cell.second->type.in(id_CPE_MULT)) {
                         if (cell.second->type.in(id_CPE_MX4)) {
-                            update_cpe_mux(cell.second.get(), id_IN1, id_INIT_L11, 0, params);
-                            update_cpe_mux(cell.second.get(), id_IN2, id_INIT_L11, 1, params);
-                            update_cpe_mux(cell.second.get(), id_IN3, id_INIT_L11, 2, params);
-                            update_cpe_mux(cell.second.get(), id_IN4, id_INIT_L11, 3, params);
-                            update_cpe_lt(cell.second.get(), id_IN5, id_INIT_L02, params, true);
-                            update_cpe_lt(cell.second.get(), c_i3 ? id_PINY1 : id_IN6, id_INIT_L02, params, false);
-                            update_cpe_lt(cell.second.get(), id_IN7, id_INIT_L03, params, true);
-                            update_cpe_lt(cell.second.get(), c_i4 ? id_PINX : id_IN8, id_INIT_L03, params, false);
+                            if (int_or_default(params, id_INIT_L20, 0) == LUT_D0) {
+                                update_cpe_lt(cell.second.get(), id_IN1, id_INIT_L00, params, true);
+                                update_cpe_lt(cell.second.get(), c_i1 ? id_PINY1 : id_IN2, id_INIT_L00, params, false);
+                                update_cpe_lt(cell.second.get(), id_IN3, id_INIT_L01, params, true);
+                                update_cpe_lt(cell.second.get(), c_i2 ? id_CINX : id_IN4, id_INIT_L01, params, false);
+                                update_cpe_mux(cell.second.get(), id_IN5, id_INIT_L10, 0, params);
+                                update_cpe_mux(cell.second.get(), id_IN6, id_INIT_L10, 1, params);
+                                update_cpe_mux(cell.second.get(), id_IN7, id_INIT_L10, 2, params);
+                                update_cpe_mux(cell.second.get(), id_IN8, id_INIT_L10, 3, params);
+                            } else {
+                                update_cpe_mux(cell.second.get(), id_IN1, id_INIT_L11, 0, params);
+                                update_cpe_mux(cell.second.get(), id_IN2, id_INIT_L11, 1, params);
+                                update_cpe_mux(cell.second.get(), id_IN3, id_INIT_L11, 2, params);
+                                update_cpe_mux(cell.second.get(), id_IN4, id_INIT_L11, 3, params);
+                                update_cpe_lt(cell.second.get(), id_IN5, id_INIT_L02, params, true);
+                                update_cpe_lt(cell.second.get(), c_i3 ? id_PINY1 : id_IN6, id_INIT_L02, params, false);
+                                update_cpe_lt(cell.second.get(), id_IN7, id_INIT_L03, params, true);
+                                update_cpe_lt(cell.second.get(), c_i4 ? id_PINX : id_IN8, id_INIT_L03, params, false);
+                            }
                         } else {
                             update_cpe_lt(cell.second.get(), id_IN1, id_INIT_L00, params, true);
                             update_cpe_lt(cell.second.get(), c_i1 ? id_PINY1 : id_IN2, id_INIT_L00, params, false);
@@ -468,7 +481,7 @@ struct BitstreamBackend
             case id_CFG_CTRL.index:
                 break;
             default:
-                log_error("Unhandled cell %s of type %s\n", cell.second.get()->name.c_str(ctx),
+                log_error("Unhandled cell %s of type %s.\n", cell.second.get()->name.c_str(ctx),
                           cell.second->type.c_str(ctx));
             }
         }
@@ -506,9 +519,7 @@ struct BitstreamBackend
 
 void GateMateImpl::write_bitstream(const std::string &device, const std::string &filename)
 {
-    std::ofstream out(filename);
-    if (!out)
-        log_error("failed to open file %s for writing (%s)\n", filename.c_str(), strerror(errno));
+    auto out = open_ofstream_and_log_error(filename, "bitstream file");
 
     BitstreamBackend be(ctx, this, device, out);
     be.write_bitstream();

@@ -26,6 +26,8 @@
 #include "command.h"
 #include "placer1.h"
 #include "placer_heap.h"
+#include "placer_static.h"
+
 #include "router1.h"
 #include "router2.h"
 #include "util.h"
@@ -86,13 +88,9 @@ void Arch::parse_vopt()
     auto vopt_desc = uarch->getUArchOptions();
     vopt_desc.add_options()("help,h", "show help");
 
-    std::vector<const char *> argv;
-    for (auto &a : args.vopts)
-        argv.push_back(a.c_str());
-
     try {
         po::parsed_options parsed =
-                po::command_line_parser((int)argv.size(), argv.data())
+                po::command_line_parser(args.vopts)
                         .style(po::command_line_style::default_style ^ po::command_line_style::allow_guessing)
                         .options(vopt_desc)
                         .run();
@@ -275,6 +273,10 @@ bool Arch::place()
         uarch->configurePlacerHeap(cfg);
         cfg.ioBufTypes.insert(id("GENERIC_IOB"));
         retVal = placer_heap(getCtx(), cfg);
+    } else if (placer == "static") {
+        PlacerStaticCfg cfg(getCtx());
+        uarch->configurePlacerStatic(cfg);
+        retVal = placer_static(getCtx(), cfg);
     } else if (placer == "sa") {
         retVal = placer1(getCtx(), Placer1Cfg(getCtx()));
     } else {
@@ -291,6 +293,9 @@ bool Arch::route()
     set_fast_pip_delays(true);
     uarch->preRoute();
     std::string router = str_or_default(settings, id("router"), defaultRouter);
+    if (router == "default") {
+        router = uarch->getDefaultRouter();
+    }
     bool result;
     if (router == "router1") {
         result = router1(getCtx(), Router1Cfg(getCtx()));
@@ -404,10 +409,10 @@ void IdString::initialize_arch(const BaseCtx *ctx) {}
 
 const std::string Arch::defaultPlacer = "heap";
 
-const std::vector<std::string> Arch::availablePlacers = {"sa", "heap"};
+const std::vector<std::string> Arch::availablePlacers = {"sa", "heap", "static"};
 
-const std::string Arch::defaultRouter = "router1";
-const std::vector<std::string> Arch::availableRouters = {"router1", "router2"};
+const std::string Arch::defaultRouter = "default";
+const std::vector<std::string> Arch::availableRouters = {"default", "router1", "router2"};
 
 void Arch::set_fast_pip_delays(bool fast_mode)
 {

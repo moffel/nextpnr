@@ -513,6 +513,8 @@ struct Arch : BaseArch<ArchRanges>
     }
     BelId getBelByLocation(Loc loc) const override
     {
+        if (loc.x < 0 || loc.x >= chip_info->width || loc.y < 0 || loc.y >= chip_info->height)
+            return BelId();
         int tile = tile_by_xy(chip_info, loc.x, loc.y);
         auto &tile_data = chip_tile_info(chip_info, tile);
         for (size_t i = 0; i < tile_data.bels.size(); i++) {
@@ -673,8 +675,8 @@ struct Arch : BaseArch<ArchRanges>
     {
         return uarch->predictDelay(src_bel, src_pin, dst_bel, dst_pin);
     }
-    delay_t getDelayEpsilon() const override { return 20; }       // TODO
-    delay_t getRipupDelayPenalty() const override { return 120; } // TODO
+    delay_t getDelayEpsilon() const override { return 20; }                 // TODO
+    delay_t getRipupDelayPenalty() const override { return ripup_penalty; } // TODO
     float getDelayNS(delay_t v) const override { return v * 0.001; }
     delay_t getDelayFromNS(float ns) const override { return delay_t(ns * 1000); }
     uint32_t getDelayChecksum(delay_t v) const override { return v; }
@@ -787,6 +789,12 @@ struct Arch : BaseArch<ArchRanges>
     // ------------------------------------------------
     // Routing methods
     void expandBoundingBox(BoundingBox &bb) const override { uarch->expandBoundingBox(bb); };
+
+    // ------------------------------------------------
+    // Resource methods
+    GroupId getResourceKeyForPip(PipId pip) const override { return uarch->getResourceKeyForPip(pip); };
+    int getResourceValueForPip(PipId pip) const override { return uarch->getResourceValueForPip(pip); };
+    bool isGroupResource(GroupId group) const override { return uarch->isGroupResource(group); };
 
     // ------------------------------------------------
 
@@ -903,6 +911,8 @@ struct Arch : BaseArch<ArchRanges>
     bool fast_pip_delays = false;
     dict<WireId, uint64_t> drive_res;
     dict<WireId, uint64_t> load_cap;
+
+    delay_t ripup_penalty = 120;
 };
 
 NEXTPNR_NAMESPACE_END

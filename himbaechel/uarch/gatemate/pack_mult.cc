@@ -240,8 +240,8 @@ CarryGenCell::CarryGenCell(CellInfo *lower, CellInfo *upper, CellInfo *comp, Cel
 {
     lower->params[id_INIT_L00] = Property(LUT_D1, 4);   // PINY1
     lower->params[id_INIT_L01] = Property(LUT_ZERO, 4); // (overriden by CIN)
-    lower->params[id_INIT_L10] = Property(is_odd_x ? LUT_OR : !enable_cinx ? LUT_ZERO : LUT_AND, 4);
-    lower->params[id_INIT_L20] = Property(is_odd_x ? LUT_OR : !enable_cinx ? LUT_ZERO : LUT_AND, 4);
+    lower->params[id_INIT_L10] = Property(is_odd_x ? LUT_OR : enable_cinx ? LUT_AND : LUT_ZERO, 4);
+    lower->params[id_INIT_L20] = Property(is_odd_x ? LUT_OR : enable_cinx ? LUT_AND : LUT_ZERO, 4);
     lower->params[id_C_FUNCTION] = Property(C_EN_CIN, 3);
     lower->params[id_C_I3] = Property(1, 1);    // PINY1 for L02
     lower->params[id_C_HORIZ] = Property(0, 1); // CINY1 for CIN_ for L03
@@ -911,11 +911,122 @@ void GateMatePacker::pack_mult()
         auto diagonal_p_width = std::min(b_width, p_width);
         auto vertical_p_width = std::max(p_width - b_width, 0);
 
+        // Do all the P output registers have the same control set?
+        bool should_pack_register = [&]() {
+            // We're using how P[0] is used as a rough heuristic for the other bits of P.
+            auto *p_zero_net = mult->getPort(ctx->idf("P[0]"));
+
+            // P[0] disconnected(???) -> don't pack
+            if (!p_zero_net)
+                return false;
+
+            // P[0] used by multiple signals -> don't pack (likely used in a combinational context)
+            if (p_zero_net->users.entries() != 1)
+                return false;
+
+            auto *p_zero_sink = (*p_zero_net->users.begin()).cell;
+            NPNR_ASSERT(p_zero_sink != nullptr);
+
+            if (p_zero_sink->type != id_CC_DFF)
+                // TODO: attempt to pack L2T4 + DFF combos.
+                return false;
+
+            for (int p = 1; p < p_width; p++) {
+                auto *p_net = mult->getPort(ctx->idf("P[%d]", p));
+                if (p_net && p_net->users.entries() == 1) {
+                    auto *p_net_sink = (*p_net->users.begin()).cell;
+                    NPNR_ASSERT(p_net_sink != nullptr);
+                    if (p_net_sink->type == id_CC_DFF) {
+                        bool incompatible = false;
+                        if (p_zero_sink->getPort(id_CLK) != p_net_sink->getPort(id_CLK)) {
+                            const char *p_zero_clk = "(none)";
+                            const char *p_net_clk = "(none)";
+                            if (p_zero_sink->getPort(id_CLK) != nullptr)
+                                p_zero_clk = p_zero_sink->getPort(id_CLK)->name.c_str(ctx);
+                            if (p_net_sink->getPort(id_CLK) != nullptr)
+                                p_net_clk = p_net_sink->getPort(id_CLK)->name.c_str(ctx);
+                            log_info("        registers have inconsistent clocks: %s vs %s\n", p_zero_clk, p_net_clk);
+                            incompatible = true;
+                        }
+                        if (p_zero_sink->getPort(id_EN) != p_net_sink->getPort(id_EN)) {
+                            const char *p_zero_en = "(none)";
+                            const char *p_net_en = "(none)";
+                            if (p_zero_sink->getPort(id_EN) != nullptr)
+                                p_zero_en = p_zero_sink->getPort(id_EN)->name.c_str(ctx);
+                            if (p_net_sink->getPort(id_EN) != nullptr)
+                                p_net_en = p_net_sink->getPort(id_EN)->name.c_str(ctx);
+                            log_info("        registers have inconsistent enables: %s vs %s\n", p_zero_en, p_net_en);
+                            incompatible = true;
+                        }
+                        if (p_zero_sink->getPort(id_SR) != p_net_sink->getPort(id_SR)) {
+                            const char *p_zero_sr = "(none)";
+                            const char *p_net_sr = "(none)";
+                            if (p_zero_sink->getPort(id_SR) != nullptr)
+                                p_zero_sr = p_zero_sink->getPort(id_SR)->name.c_str(ctx);
+                            if (p_net_sink->getPort(id_SR) != nullptr)
+                                p_net_sr = p_net_sink->getPort(id_EN)->name.c_str(ctx);
+                            log_info("        registers have inconsistent resets: %s vs %s\n", p_zero_sr, p_net_sr);
+                            incompatible = true;
+                        }
+                        if (uarch->get_dff_config(p_zero_sink) != uarch->get_dff_config(p_net_sink))
+                            log_info("        registers have different configurations\n");
+                        if (incompatible) {
+                            log_info("        ...not packing output register\n");
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }();
+
+        auto create_p_register = [&](CellInfo *cpe_half, CellInfo *sink, int x_offset, int y_offset, bool upper,
+                                     int p) {
+            // Instantiate a P passthrough L2T4 for the flop.
+            auto *p_passthru =
+                    create_cell_ptr(id_CPE_L2T4, ctx->idf("%s$p[%d]_passthru", cpe_half->name.c_str(ctx), p));
+
+            p_passthru->params[id_INIT_L00] = Property(LUT_D0, 4);
+            p_passthru->params[id_INIT_L01] = Property(LUT_ZERO, 4);
+            p_passthru->params[id_INIT_L10] = Property(LUT_D0, 4);
+
+            // Reconfigure the flop.
+            sink->renamePort(id_D, id_DIN);
+            sink->renamePort(id_Q, id_DOUT);
+            sink->type = id_CPE_FF;
+
+            // Connect the passthrough.
+            sink->movePortTo(id_DIN, p_passthru, id_IN1);
+
+            auto *p_passthru_net = ctx->createNet(ctx->idf("%s$p", p_passthru->name.c_str(ctx)));
+            p_passthru->connectPort(id_OUT, p_passthru_net);
+            sink->connectPort(id_DIN, p_passthru_net);
+
+            // Constrain the passthrough and flop.
+            constrain_cell(p_passthru, x_offset, y_offset, upper ? CPE_LT_U_Z : CPE_LT_L_Z);
+
+            constrain_cell(sink, x_offset, y_offset, upper ? CPE_FF_U_Z : CPE_FF_L_Z);
+
+            log_info("        Constrained '%s' as register for P[%d] at (%d, %d).\n", sink->name.c_str(ctx), p,
+                     x_offset, y_offset);
+        };
+
         for (int p = 0; p < diagonal_p_width; p++) {
             auto &mult_cell = m.cols[p / 2].mults[0];
             auto *cpe_half = (p % 2 == 1) ? mult_cell.upper : mult_cell.lower;
 
             mult->movePortTo(ctx->idf("P[%d]", p), cpe_half, id_CPOUT);
+
+            auto *cpe_half_cpout = cpe_half->getPort(id_CPOUT);
+            if (cpe_half_cpout && cpe_half_cpout->users.entries() == 1) {
+                auto cpe_half_cpout_user = *cpe_half_cpout->users.begin();
+                auto *sink = cpe_half_cpout_user.cell;
+                NPNR_ASSERT(sink != nullptr);
+                if (sink->type == id_CC_DFF && should_pack_register) {
+                    create_p_register(cpe_half, sink, b_width / 2, b_width / 2 + p / 2, p % 2 == 1, p);
+                }
+            }
         }
 
         for (int p = 0; p < vertical_p_width; p++) {
@@ -923,6 +1034,17 @@ void GateMatePacker::pack_mult()
             auto *cpe_half = (p % 2 == 1) ? mult_cell.upper : mult_cell.lower;
 
             mult->movePortTo(ctx->idf("P[%d]", p + diagonal_p_width), cpe_half, id_CPOUT);
+
+            auto *cpe_half_cpout = cpe_half->getPort(id_CPOUT);
+            if (cpe_half_cpout && cpe_half_cpout->users.entries() == 1) {
+                auto cpe_half_cpout_user = *cpe_half_cpout->users.begin();
+                auto *sink = cpe_half_cpout_user.cell;
+                NPNR_ASSERT(sink != nullptr);
+                if (sink->type == id_CC_DFF && should_pack_register) {
+                    create_p_register(cpe_half, sink, b_width / 2, b_width / 2 + diagonal_p_width / 2 + p / 2,
+                                      p % 2 == 1, p + diagonal_p_width);
+                }
+            }
         }
 
         // Clean up the multiplier.

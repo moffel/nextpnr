@@ -1077,11 +1077,34 @@ struct NexusPacker
     {
         // Convert primitives from their non-CORE variant to their CORE variant
         static const dict<IdString, IdString> prim_map = {
-                {id_OSCA, id_OSC_CORE},          {id_DP16K, id_DP16K_MODE},       {id_PDP16K, id_PDP16K_MODE},
-                {id_PDPSC16K, id_PDPSC16K_MODE}, {id_SP16K, id_SP16K_MODE},       {id_FIFO16K, id_FIFO16K_MODE},
-                {id_SP512K, id_SP512K_MODE},     {id_DPSC512K, id_DPSC512K_MODE}, {id_PDPSC512K, id_PDPSC512K_MODE},
-                {id_PLL, id_PLL_CORE},           {id_DPHY, id_DPHY_CORE},
+                {id_OSCA, id_OSC_CORE},
+                {id_DP16K, id_DP16K_MODE},
+                {id_PDP16K, id_PDP16K_MODE},
+                {id_PDPSC16K, id_PDPSC16K_MODE},
+                {id_SP16K, id_SP16K_MODE},
+                {id_FIFO16K, id_FIFO16K_MODE},
+                {id_SP512K, id_SP512K_MODE},
+                {id_DPSC512K, id_DPSC512K_MODE},
+                {id_PDPSC512K, id_PDPSC512K_MODE},
+                {id_PLL, id_PLL_CORE},
+                {id_DPHY, id_DPHY_CORE},
+                {id_MULTIBOOT, id_CONFIG_MULTIBOOT_CORE},
+                {id_CONFIG_LMMI, id_CONFIG_LMMI_CORE},
         };
+
+        // extra prefix needed for this primitive for some reason
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type != id_MULTIBOOT)
+                continue;
+            std::vector<IdString> pin_names;
+            for (const auto &port : ci->ports) {
+                pin_names.push_back(port.first);
+            }
+            for (auto pin_name : pin_names) {
+                ci->renamePort(pin_name, ctx->idf("CIB%s", pin_name.c_str(ctx)));
+            }
+        }
 
         for (auto &cell : ctx->cells) {
             CellInfo *ci = cell.second.get();
@@ -1204,6 +1227,61 @@ struct NexusPacker
         }
     }
 
+    void pack_iodelay()
+    {
+        dict<IdString, XFormRule> base_iodelay_rules;
+        base_iodelay_rules[id_DELAYB].new_type = id_IOLOGIC;
+
+        XFormRule delay_rule;
+        delay_rule.param_xform[id_DEL_VALUE] = ctx->id("DELAY.DEL_VALUE");
+        delay_rule.param_xform[id_COARSE_DELAY] = ctx->id("DELAY.COARSE_DELAY");
+
+        base_iodelay_rules[id_DELAYB] = delay_rule;
+        base_iodelay_rules[id_DELAYA] = delay_rule;
+
+        base_iodelay_rules[id_DELAYA].param_xform[id_COARSE_DELAY_MODE] = ctx->id("DELAY.COARSE_DELAY_MODE");
+        base_iodelay_rules[id_DELAYA].param_xform[id_EDGE_MONITOR] = ctx->id("DELAY.EDGE_MONITOR");
+        base_iodelay_rules[id_DELAYA].param_xform[id_WAIT_FOR_EDGE] = ctx->id("DELAY.WAIT_FOR_EDGE");
+
+        base_iodelay_rules[id_DELAYA].port_xform[id_COARSE0] = id_CIBCRS0;
+        base_iodelay_rules[id_DELAYA].port_xform[id_COARSE1] = id_CIBCRS1;
+        base_iodelay_rules[id_DELAYA].port_xform[id_CFLAG] = id_COUT;
+
+        // Find IO delays, and convert them to IOLOGIC
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (!ci->type.in(id_DELAYA, id_DELAYB))
+                continue;
+            if (str_or_default(ci->params, id_DEL_MODE, "USER_DEFINED") != "USER_DEFINED") {
+                // TODO: DEL_MODE (we need to work out how to convert these to a DEL_VALUE)
+                log_error("DEL_MODE other than \"USER_DEFINED\" is not supported on DELAY '%s'\n", ci->name.c_str(ctx));
+            }
+            xform_cell(base_iodelay_rules, ci);
+
+            NetInfo *a = ci->getPort(id_A);
+            if (a != nullptr && a->driver.cell != nullptr &&
+                a->driver.cell->type.in(id_SEIO18_CORE, id_SEIO33_CORE, id_DIFFIO18_CORE)) {
+                // It's an input delay
+                log_info("   processing input delay cell '%s'\n", ci->name.c_str(ctx));
+                ci->params[id_INMUX] = std::string("DELAY");
+                ci->renamePort(id_A, id_DI);
+                ci->renamePort(id_Z, id_INDD);
+                continue;
+            }
+            NetInfo *z = ci->getPort(id_Z);
+            if (z != nullptr && z->users.entries() == 1 &&
+                (*z->users.begin()).cell->type.in(id_SEIO18_CORE, id_SEIO33_CORE, id_DIFFIO18_CORE)) {
+                // It's an output delay
+                log_info("   processing output delay cell '%s'\n", ci->name.c_str(ctx));
+                ci->params[id_OUTMUX] = std::string("DELAY");
+                ci->renamePort(id_A, id_TXDATA0);
+                ci->renamePort(id_Z, id_DOUT);
+                continue;
+            }
+            log_error("Failed to determine if delay cell '%s' was an input or output delay.\n", ci->name.c_str(ctx));
+        }
+    }
+
     void transform_iologic()
     {
         dict<IdString, XFormRule> iol_rules;
@@ -1240,6 +1318,72 @@ struct NexusPacker
         ctx->cells.erase(mergee->name);
     }
 
+    void merge_delay_iol()
+    {
+        // Find pairs of delay IOLOGIC and logic IOLOGIC
+        // <delay iol, logic iol, ouput>
+        std::vector<std::tuple<CellInfo *, CellInfo *, bool>> delay_iol;
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (!ci->type.in(id_SIOLOGIC, id_IOLOGIC))
+                continue;
+            NetInfo *indd = ci->getPort(id_INDD);
+            if (indd && indd->users.entries() == 1) {
+                auto usr = *(indd->users.begin());
+                if (usr.cell->type.in(id_IOLOGIC, id_SIOLOGIC) && usr.port == id_DI) {
+                    delay_iol.emplace_back(ci, usr.cell, false);
+                    continue;
+                }
+            }
+            NetInfo *txdata0 = ci->getPort(id_TXDATA0);
+            if (txdata0 && txdata0->driver.cell != nullptr) {
+                auto drv = txdata0->driver;
+                if (drv.cell->type.in(id_IOLOGIC, id_SIOLOGIC) && drv.port == id_DOUT) {
+                    delay_iol.emplace_back(ci, drv.cell, true);
+                    continue;
+                }
+            }
+        }
+        // Combine the pairs together
+        for (const auto &iol_pair : delay_iol) {
+            CellInfo *delay_iol, *logic_iol;
+            bool is_output;
+            std::tie(delay_iol, logic_iol, is_output) = iol_pair;
+            // Copy delay parameters across (except MODE)
+            for (auto &param : delay_iol->params) {
+                if (param.first == id_MODE)
+                    continue;
+                logic_iol->params[param.first] = param.second;
+            }
+            // Deal with interconnectivity
+            if (is_output) {
+                // Configure delay for use with DDR
+                logic_iol->params[id_DELAYMUX] = std::string("OUT_REG");
+
+                NetInfo *out_net = delay_iol->getPort(id_DOUT);
+                delay_iol->disconnectPort(id_DOUT);
+                delay_iol->disconnectPort(id_TXDATA0);
+                logic_iol->disconnectPort(id_DOUT);
+                logic_iol->connectPort(id_DOUT, out_net);
+            } else {
+                NetInfo *in_net = delay_iol->getPort(id_DI);
+                delay_iol->disconnectPort(id_DI);
+                delay_iol->disconnectPort(id_INDD);
+                logic_iol->disconnectPort(id_DI);
+                logic_iol->connectPort(id_DI, in_net);
+            }
+            // Move the rest of the ports
+            for (auto &port : delay_iol->ports) {
+                if (!port.second.net)
+                    continue;
+                delay_iol->movePortTo(port.first, logic_iol, port.first);
+            }
+            log_info("   merged delay IOLOGIC '%s' into logic IOLOGIC '%s'\n", delay_iol->name.c_str(ctx),
+                     logic_iol->name.c_str(ctx));
+            ctx->cells.erase(delay_iol->name);
+        }
+    }
+
     void constrain_merge_iol()
     {
         dict<IdString, std::vector<CellInfo *>> io_to_iol;
@@ -1269,8 +1413,11 @@ struct NexusPacker
                 merge_iol_cell(iol, io_iol.second.at(i));
             // Constrain, and update type if appropriate
             CellInfo *iob = ctx->cells.at(io_iol.first).get();
-            if (iob->type == id_SEIO33_CORE)
+            if (iob->type == id_SEIO33_CORE) {
                 iol->type = id_SIOLOGIC;
+                // DELAYMUX does not exist in SIOLOGIC, implicit from OUTMUX in this case
+                iol->params.erase(id_DELAYMUX);
+            }
             Loc iol_loc = ctx->getBelLocation(get_bel_attr(iob));
             if (iob->type == id_DIFFIO18_CORE)
                 iol_loc.z = 3;
@@ -1287,7 +1434,9 @@ struct NexusPacker
     void pack_iologic()
     {
         log_info("Packing IOLOGIC...\n");
+        pack_iodelay();
         transform_iologic();
+        merge_delay_iol();
         constrain_merge_iol();
     }
 

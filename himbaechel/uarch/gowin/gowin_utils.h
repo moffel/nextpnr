@@ -14,7 +14,8 @@ static constexpr uint32_t FLAG_SIMPLE_IO = 0x100;
 
 namespace WireFlags {
 static constexpr uint32_t FLAG_CLOCK_GATE = 0x1;
-}
+static constexpr uint32_t FLAG_BOTTOM_HALF = 0x2;
+} // namespace WireFlags
 
 struct GowinUtils
 {
@@ -71,6 +72,8 @@ struct GowinUtils
         }
         return ni->users.entries() != 0;
     }
+    // Remove [ and ] from port names
+    void remove_brackets(CellInfo *ci);
 
     // net sources
     inline bool driver_is_io(const PortRef &driver) { return CellTypePort(driver) == CellTypePort(id_IBUF, id_O); }
@@ -96,21 +99,31 @@ struct GowinUtils
         return chip_wire_info(ctx->chip_info, wire).flags & WireFlags::FLAG_CLOCK_GATE;
     }
 
+    bool wire_in_bottom_half(WireId wire) const
+    {
+        return chip_wire_info(ctx->chip_info, wire).flags & WireFlags::FLAG_BOTTOM_HALF;
+    }
+    bool get_spine_select_wire(WireId spine, std::vector<std::pair<WireId, int>> &);
+
     // BSRAM
-    bool has_SP32(void);
-    bool need_SP_fix(void);
-    bool need_SDP_fix(void);
-    bool need_BSRAM_OUTREG_fix(void);
-    bool need_BSRAM_RESET_fix(void);
-    bool need_BLKSEL_fix(void);
-    bool has_PLL_HCLK(void);
-    bool has_CLKDIV_HCLK(void);
+    bool has_SP32(void) const;
+    bool need_SP_fix(void) const;
+    bool need_SDP_fix(void) const;
+    bool need_BSRAM_OUTREG_fix(void) const;
+    bool need_BSRAM_DP_CE_fix(void) const;
+    bool need_BSRAM_RESET_fix(void) const;
+    bool need_BLKSEL_fix(void) const;
+    bool has_PLL_HCLK(void) const;
+    bool has_CLKDIV_HCLK(void) const;
+    bool has_5A_HCLK(void) const;
 
     // Power saving
-    bool has_BANDGAP(void);
+    bool has_BANDGAP(void) const;
 
     // Pin function configuration via wires
-    bool has_PINCFG(void);
+    bool has_PINCFG(void) const;
+    bool need_CFGPINS_INVERSION(void) const;
+    bool has_I2CCFG(void) const;
 
     // Logic cell structure
     bool has_DFF67(void) const;
@@ -118,11 +131,16 @@ struct GowinUtils
     // ALU
     bool has_CIN_MUX(void) const;
 
+    // Clock MUX
+    bool has_spine_enable_nets(void) const;
+
     // DSP
+    bool has_5A_DSP(void) const;
     inline int get_dsp_18_z(int z) const { return z & (~3); }
     inline int get_dsp_9_idx(int z) const { return z & 3; }
     inline int get_dsp_18_idx(int z) const { return z & 4; }
     inline int get_dsp_paired_9(int z) const { return (3 - get_dsp_9_idx(z)) | (z & (~3)); }
+    inline int get_dsp_paired_12(int z) const { return BelZ::MULT12X12_1_Z - (z & 1); }
     inline int get_dsp_mult_from_padd(int padd_z) const { return padd_z + 8; }
     inline int get_dsp_padd_from_mult(int mult_z) const { return mult_z - 8; }
     inline int get_dsp_next_macro(int z) const { return z + 32; }
@@ -132,6 +150,7 @@ struct GowinUtils
     Loc get_dsp_next_9_in_chain(Loc from) const;
     Loc get_dsp_next_macro_in_chain(Loc from) const;
     Loc get_dsp_next_in_chain(Loc from, IdString dsp_type) const;
+    Loc get_dsp_next_in_chain_5a(Loc from) const;
 
     // check bus.
     // This is necessary to find the head in the DSP chain - these buses are
@@ -174,6 +193,8 @@ struct GowinUtils
     std::unique_ptr<CellInfo> create_cell(IdString name, IdString type);
 
     // HCLK
+    void get_clkdiv2_locs(int hclk_idx, std::vector<Loc> &locs);
+    int get_hclk_for_io(Loc io_loc) const;
     BelId get_clkdiv_for_clkdiv2(BelId clkdiv2_bel) const;
     BelId get_other_hclk_clkdiv2(BelId clkdiv2_bel) const;
     BelId get_other_hclk_clkdiv(BelId clkdiv_bel) const;
@@ -225,6 +246,10 @@ struct GowinUtils
 
     // Find a maximum matching in a bipartite graph, g
     std::vector<int> kuhn_find_maximum_bipartite_matching(int n, int k, std::vector<std::vector<int>> &g);
+
+    // Get spec locations
+    int get_center_row(void) const;
+    int get_center_col(void) const;
 };
 
 NEXTPNR_NAMESPACE_END

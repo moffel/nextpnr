@@ -170,7 +170,7 @@ struct FabFasmWriter
             unsigned width = 1U << cfg.clb.lut_k;
             write_int_vector(stringf("INIT[%d:0]", width - 1), init, width); // todo lut depermute and thru
             if (bool_or_default(lc->params, id_I0MUX, false))
-                add_feature("IOmux"); // typo in FABulous?
+                add_feature("I0mux");
         }
         if (lc->type == id_FABULOUS_LC) {
             write_bool(lc, "FF");
@@ -204,6 +204,8 @@ struct FabFasmWriter
 
     void write_generic_cell(const CellInfo *ci)
     {
+        if (ci->bel == BelId())
+            return;
         prefix = format_name(ctx->getBelName(ci->bel)) + ".";
         for (auto &param : ci->params) {
             // TODO: better parameter type auto-detection
@@ -217,7 +219,7 @@ struct FabFasmWriter
             } else {
                 // vector type parameter
                 int msb = int(param.second.str.size()) - 1;
-                out << prefix << param.first.c_str(ctx) << "[" << msb << ":0] = ";
+                out << prefix << param.first.c_str(ctx) << "[" << msb << ":0] = 'b";
                 for (auto bit : boost::adaptors::reverse(param.second.str))
                     out << bit;
                 out << std::endl;
@@ -250,7 +252,8 @@ struct FabFasmWriter
             write_logic(ci);
         else if (ci->type == id_IO_1_bidirectional_frame_config_pass)
             write_io(ci);
-        else if (ci->type.in(id_InPass4_frame_config, id_OutPass4_frame_config))
+        else if (ci->type.in(id_InPass4_frame_config, id_OutPass4_frame_config, id_InPass4_frame_config_mux,
+                             id_OutPass4_frame_config_mux))
             write_iopass(ci);
         else
             write_generic_cell(ci);

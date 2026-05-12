@@ -34,7 +34,6 @@
 #include "parallel_refine.h"
 #include "place_common.h"
 #include "placer1.h"
-#include "scope_lock.h"
 #include "timing.h"
 #include "util.h"
 
@@ -81,7 +80,7 @@ struct MoveCell
 {
     StaticRect rect;
     // TODO: multiple contiguous vectors is probably faster than an array of structs, but also messier
-    RealPair pos, ref_pos, last_pos, last_ref_pos;
+    RealPair pos, ref_pos, last_pos, last_ref_pos, solver_pos;
     RealPair ref_wl_grad, wl_grad, last_wl_grad;
     RealPair ref_dens_grad, dens_grad, last_dens_grad;
     RealPair ref_total_grad, total_grad, last_total_grad;
@@ -119,6 +118,7 @@ struct PlacerMacro
     CellInfo *root;
     std::vector<int32_t> conc_cells;
     dict<ClusterGroupKey, std::vector<CellInfo *>> cells;
+    RealPair centroid;
 };
 
 struct PlacerBin
@@ -130,11 +130,11 @@ struct PlacerBin
 struct PlacerPort
 {
     // for wirelength data
-    static constexpr float invalid = std::numeric_limits<float>::lowest();
+    static constexpr double invalid = std::numeric_limits<double>::lowest();
 
     PortRef ref;
-    RealPair max_exp{invalid, invalid};
-    RealPair min_exp{invalid, invalid};
+    DoublePair max_exp{invalid, invalid};
+    DoublePair min_exp{invalid, invalid};
     bool has_max_exp(Axis axis) const { return max_exp.at(axis) != invalid; }
     bool has_min_exp(Axis axis) const { return min_exp.at(axis) != invalid; }
 };
@@ -144,8 +144,8 @@ struct PlacerNet
     NetInfo *ni;
     bool skip = false;
     RealPair b1, b0; // real bounding box
-    RealPair min_exp, x_min_exp;
-    RealPair max_exp, x_max_exp;
+    DoublePair min_exp, x_min_exp;
+    DoublePair max_exp, x_max_exp;
     RealPair wa_wl;
     // lines up with user indexes; plus one for driver
     std::vector<PlacerPort> ports;
@@ -256,12 +256,17 @@ class StaticPlacer
     ThreadPool pool;
 
     int width, height;
+    int bel_width, bel_height;
+
     int iter = 0;
     bool fft_debug = false;
     bool dump_density = false;
 
     // legalisation queue
     std::priority_queue<std::pair<int, IdString>> to_legalise;
+
+    std::vector<int> place_x_to_bel_x, place_y_to_bel_y;
+    std::vector<int> bel_x_to_place_x, bel_y_to_place_y;
 
     void prepare_cells()
     {
@@ -279,29 +284,71 @@ class StaticPlacer
         }
     }
 
-    bool lookup_group(IdString type, int &group, StaticRect &rect)
+    bool lookup_group(const CellInfo *ci, int &group, StaticRect &rect)
     {
         for (size_t i = 0; i < cfg.cell_groups.size(); i++) {
             const auto &g = cfg.cell_groups.at(i);
-            if (g.cell_area.count(type)) {
+            if (g.cell_area.count(ci->type)) {
                 group = i;
-                rect = g.cell_area.at(type);
+                rect = g.cell_area.at(ci->type);
+                if (auto rect_override = cfg.get_cell_area_override(ctx, ci)) {
+                    rect = *rect_override;
+                }
                 return true;
             }
         }
         return false;
     }
 
+    void init_grid()
+    {
+        // The bel grid might have holes (e.g. Xilinx INT/NULL tiles). This makes our FFT much
+        // more annoying so flatten these out to a compacter grid we use internal to the placer
+        std::set<int> used_cols;
+        std::set<int> used_rows;
+        bel_width = 0;
+        bel_height = 0;
+        for (auto bel : ctx->getBels()) {
+            Loc loc = ctx->getBelLocation(bel);
+            bel_width = std::max(bel_width, loc.x + 1);
+            bel_height = std::max(bel_height, loc.y + 1);
+            used_cols.insert(loc.x);
+            used_rows.insert(loc.y);
+        }
+        bel_x_to_place_x.resize(bel_width, -1);
+        bel_y_to_place_y.resize(bel_height, -1);
+        for (int col : used_cols) {
+            bel_x_to_place_x.at(col) = int(place_x_to_bel_x.size());
+            place_x_to_bel_x.push_back(col);
+        }
+        for (int row : used_rows) {
+            bel_y_to_place_y.at(row) = int(place_y_to_bel_y.size());
+            place_y_to_bel_y.push_back(row);
+        }
+        width = int(used_cols.size());
+        height = int(used_rows.size());
+
+        log_info("⌁ bel grid %dx%d, placer grid %dx%d...\n", bel_width, bel_height, width, height);
+    }
+
+    Loc get_place_loc(Loc bel_loc)
+    {
+        int x = bel_x_to_place_x.at(bel_loc.x), y = bel_y_to_place_y.at(bel_loc.y);
+        NPNR_ASSERT(x != -1);
+        NPNR_ASSERT(y != -1);
+
+        return Loc(x, y, bel_loc.z);
+    }
+
+    Loc get_bel_loc(Loc place_loc)
+    {
+        return Loc(place_x_to_bel_x.at(std::max(0, std::min(place_loc.x, width - 1))),
+                   place_y_to_bel_y.at(std::max(0, std::min(place_loc.y, height - 1))), place_loc.z);
+    }
+
     void init_bels()
     {
         log_info("⌁ initialising bels...\n");
-        width = 0;
-        height = 0;
-        for (auto bel : ctx->getBels()) {
-            Loc loc = ctx->getBelLocation(bel);
-            width = std::max(width, loc.x + 1);
-            height = std::max(height, loc.y + 1);
-        }
         dict<IdString, int> beltype2group;
         for (int i = 0; i < int(groups.size()); i++) {
             groups.at(i).loc_area.reset(width, height);
@@ -309,7 +356,7 @@ class StaticPlacer
                 beltype2group[bel_type.first] = i;
         }
         for (auto bel : ctx->getBels()) {
-            Loc loc = ctx->getBelLocation(bel);
+            Loc loc = get_place_loc(ctx->getBelLocation(bel));
             IdString type = ctx->getBelType(bel);
             auto fnd = beltype2group.find(type);
             if (fnd == beltype2group.end())
@@ -320,6 +367,8 @@ class StaticPlacer
                 for (int dx = 0; dx <= int(size.w); dx++) {
                     float h = (dy == int(size.h)) ? (size.h - int(size.h)) : 1;
                     float w = (dx == int(size.w)) ? (size.w - int(size.w)) : 1;
+                    if ((loc.x + dx) >= width || (loc.y + dy) >= height)
+                        continue;
                     group.loc_area.at(loc.x + dx, loc.y + dy) += w * h;
                 }
             }
@@ -338,7 +387,7 @@ class StaticPlacer
 
             auto &nd = nets.back();
             nd.ni = ni;
-            nd.skip = (ni->driver.cell == nullptr);    // (or global buffer?)
+            nd.skip = (ni->driver.cell == nullptr || cfg.glbBufTypes.count(ni->driver.cell->type));
             nd.ports.resize(ni->users.capacity() + 1); // +1 for the driver
             nd.ports.back().ref = ni->driver;
             for (auto usr : ni->users.enumerate()) {
@@ -397,7 +446,7 @@ class StaticPlacer
             NPNR_ASSERT_MSG(ci->bel != BelId(),
                             stringf("Cell %s of type %s has no bel", ci->name.c_str(ctx), ci->type.c_str(ctx))
                                     .c_str()); // already fixed
-            return RealPair(ctx->getBelLocation(ci->bel), 0.5f);
+            return RealPair(get_place_loc(ctx->getBelLocation(ci->bel)), 0.5f);
         } else {
             return ref ? mcells.at(ci->udata).ref_pos : mcells.at(ci->udata).pos;
         }
@@ -412,7 +461,7 @@ class StaticPlacer
             int cell_group;
             StaticRect rect;
             // Mismatched group case
-            if (!lookup_group(ci->type, cell_group, rect)) {
+            if (!lookup_group(ci, cell_group, rect)) {
                 if (ci->bel == BelId()) {
                     for (auto bel : ctx->getBels()) {
                         if (ctx->isValidBelForCellType(ci->type, bel) && ctx->checkBelAvail(bel)) {
@@ -448,7 +497,7 @@ class StaticPlacer
                 if (ci->bel != BelId()) {
                     // Currently; treat all ready-placed cells as fixed (eventually we might do incremental ripups
                     // here...)
-                    Loc loc = ctx->getBelLocation(ci->bel);
+                    Loc loc = get_place_loc(ctx->getBelLocation(ci->bel));
                     mc.pos.x = loc.x + 0.5;
                     mc.pos.y = loc.y + 0.5;
                     mc.is_fixed = true;
@@ -458,6 +507,8 @@ class StaticPlacer
         // Process clustered cells
         for (int i = 0; i < int(macros.size()); i++) {
             auto &m = macros.at(i);
+            float total_area = 0;
+            m.centroid = RealPair(0, 0);
             for (auto &kv : m.cells) {
                 const auto &g = cfg.cell_groups.at(kv.first.group);
                 // Only treat zero-area cells as zero-area; if this cluster also contains non-zero area cells
@@ -494,7 +545,7 @@ class StaticPlacer
                     if (kv.second.front()->bel != BelId()) {
                         // Currently; treat all ready-placed cells as fixed (eventually we might do incremental ripups
                         // here...)
-                        Loc loc = ctx->getBelLocation(kv.second.front()->bel);
+                        Loc loc = get_place_loc(ctx->getBelLocation(kv.second.front()->bel));
                         mc.pos.x = loc.x + 0.5;
                         mc.pos.y = loc.y + 0.5;
                         mc.is_fixed = true;
@@ -507,9 +558,14 @@ class StaticPlacer
                     cc.macro_idx = i;
                     cc.chunk_dx = kv.first.dx;
                     cc.chunk_dy = kv.first.dy;
+                    m.centroid.x += float(kv.first.dx) * cluster_size.area();
+                    m.centroid.y += float(kv.first.dy) * cluster_size.area();
+                    total_area += cluster_size.area();
                     m.conc_cells.push_back(idx);
                 }
             }
+            if (total_area > 0)
+                m.centroid /= total_area;
         }
     }
 
@@ -538,7 +594,6 @@ class StaticPlacer
     {
         log_info("⌁ inserting spacers...\n");
 
-        int inserted_spacers = 0;
         for (int group = 0; group < int(groups.size()); group++) {
             const auto &cg = cfg.cell_groups.at(group);
             const auto &g = groups.at(group);
@@ -546,6 +601,7 @@ class StaticPlacer
             log_info("⌁   group %s pre-spacer utilisation %.02f%% (target %.02f%%)\n", ctx->nameOf(cg.name),
                      (util * 100.0), (target_util * 100.0));
             // TODO: better computation of spacer size and placement?
+            int inserted_spacers = 0;
             int spacer_count = (g.total_area * target_util - g.concrete_area) / cg.spacer_rect.area();
             if (spacer_count <= 0)
                 continue;
@@ -558,8 +614,8 @@ class StaticPlacer
                 add_cell(cg.spacer_rect, group, RealPair(x + ctx->rngf(1.0), y + ctx->rngf(1.0)), nullptr /*spacer*/);
                 ++inserted_spacers;
             }
+            log_info("⌁   group %s inserted a total of %d spacers\n", ctx->nameOf(cg.name), inserted_spacers);
         }
-        log_info("⌁   inserted a total of %d spacers\n", inserted_spacers);
     }
 
     // TODO: dark node insertion when we have obstructions or non-rectangular placement regions
@@ -604,8 +660,8 @@ class StaticPlacer
             height = bin_h;
         }
 
-        double x0 = pos.x, x1 = pos.x + width;
-        double y0 = pos.y, y1 = pos.y + height;
+        double x0 = pos.x - width / 2.f, x1 = pos.x + width / 2.f;
+        double y0 = pos.y - height / 2.f, y1 = pos.y + height / 2.f;
         for (int y = int(y0 / bin_h); y <= int(y1 / bin_h); y++) {
             for (int x = int(x0 / bin_w); x <= int(x1 / bin_w); x++) {
                 if (x < 0 || x >= m || y < 0 || y >= m)
@@ -649,6 +705,8 @@ class StaticPlacer
             g.conc_density.reset(width, height, 0);
         for (int idx = 0; idx < int(ccells.size()); idx++) {
             auto &mc = mcells.at(idx);
+            if (mc.is_fixed)
+                continue;
             auto &g = groups.at(mc.group);
             auto loc = mc.pos;
             auto size = mc.rect;
@@ -792,7 +850,9 @@ class StaticPlacer
                 if (emax > min_wirelen_force) {
                     port.max_exp.at(axis) = std::exp(emax);
                     net.max_exp.at(axis) += port.max_exp.at(axis);
+                    NPNR_ASSERT(std::isfinite(port.max_exp.at(axis)));
                     net.x_max_exp.at(axis) += loc.at(axis) * port.max_exp.at(axis);
+                    NPNR_ASSERT(std::isfinite(net.x_max_exp.at(axis)));
                 } else {
                     port.max_exp.at(axis) = PlacerPort::invalid;
                 }
@@ -826,12 +886,14 @@ class StaticPlacer
                 d_min = (min_sum * (pd.min_exp.at(axis) * (1.0f - wl_coeff.at(axis) * loc.at(axis))) +
                          wl_coeff.at(axis) * pd.min_exp.at(axis) * x_min_sum) /
                         (min_sum * min_sum);
+                NPNR_ASSERT(std::isfinite(d_min));
             }
             if (pd.has_max_exp(axis)) {
                 double max_sum = nd.max_exp.at(axis), x_max_sum = nd.x_max_exp.at(axis);
                 d_max = (max_sum * (pd.max_exp.at(axis) * (1.0f + wl_coeff.at(axis) * loc.at(axis))) -
                          wl_coeff.at(axis) * pd.max_exp.at(axis) * x_max_sum) /
                         (max_sum * max_sum);
+                NPNR_ASSERT(std::isfinite(d_max));
             }
             float crit = 0.0;
             if (cfg.timing_driven) {
@@ -848,6 +910,7 @@ class StaticPlacer
             gradient += weight * (d_min - d_max);
         }
 
+        NPNR_ASSERT(std::isfinite(gradient));
         return gradient;
     }
 
@@ -910,8 +973,9 @@ class StaticPlacer
                 wirelen_sum += std::abs(mc.ref_wl_grad.x) + std::abs(mc.ref_wl_grad.y);
                 force_sum += std::abs(mc.ref_dens_grad.x) + std::abs(mc.ref_dens_grad.y);
             }
-            const float eta = 1e-1;
+            const float eta = 1e-3;
             float init_dens_penalty = eta * (wirelen_sum / force_sum);
+            NPNR_ASSERT(std::isfinite(init_dens_penalty));
             log_info("initial density penalty: %f\n", init_dens_penalty);
             dens_penalty.resize(groups.size(), init_dens_penalty);
             update_potentials(true); // set initial potential
@@ -972,8 +1036,8 @@ class StaticPlacer
             // update bounding box
             compute_bounds(net, Axis::X, false);
             compute_bounds(net, Axis::Y, false);
-            hpwl += net.b1.x - net.b0.x;
-            hpwl += net.b1.y - net.b0.y;
+            hpwl += cfg.hpwl_scale_x * (net.b1.x - net.b0.x);
+            hpwl += cfg.hpwl_scale_y * (net.b1.y - net.b0.y);
         }
         return hpwl;
     }
@@ -1026,7 +1090,7 @@ class StaticPlacer
         for (int g = 0; g < int(groups.size()); g++) {
             if (!groups.at(g).enabled)
                 continue;
-            float next_penalty = dens_penalty.at(g) + (penalty_incr * (rel_pot.at(g) / pot_norm));
+            float next_penalty = dens_penalty.at(g) * (1 + (penalty_incr * (rel_pot.at(g) / pot_norm)));
             dens_penalty.at(g) = next_penalty;
         }
     }
@@ -1082,7 +1146,7 @@ class StaticPlacer
     {
         // Move the post-solve position of a chain towards be the weighted average of its constituents
         // The strength increases with iterations
-        float alpha = std::min<float>(std::pow(1.002f, iter) - 1, 1.0f);
+        float alpha = std::min<float>(std::pow(1.0005f, iter) - 1, 1.0f);
         float dist = 0;
         for (int i = 0; i < int(macros.size()); i++) {
             auto &macro = macros.at(i);
@@ -1101,9 +1165,12 @@ class StaticPlacer
             for (int c : macro.conc_cells) {
                 auto &cc = ccells.at(c);
                 auto &mc = mcells.at(c);
+                if (mc.is_fixed)
+                    continue;
                 auto last_pos = mc.pos;
-                mc.pos = mc.pos * (1 - alpha) + (pos + RealPair(cc.chunk_dx, cc.chunk_dy)) * alpha;
-                mc.ref_pos = mc.ref_pos * (1 - alpha) + (ref_pos + RealPair(cc.chunk_dx, cc.chunk_dy)) * alpha;
+                mc.pos = mc.pos * (1 - alpha) + (pos + RealPair(cc.chunk_dx, cc.chunk_dy) - macro.centroid) * alpha;
+                mc.ref_pos = mc.ref_pos * (1 - alpha) +
+                             (ref_pos + RealPair(cc.chunk_dx, cc.chunk_dy) - macro.centroid) * alpha;
                 dist += std::sqrt(std::pow(last_pos.x - mc.pos.x, 2) + std::pow(last_pos.y - mc.pos.y, 2));
             }
         }
@@ -1136,6 +1203,13 @@ class StaticPlacer
         update_chains();
         update_gradients(true);
         update_potentials();
+        if (ctx->verbose) {
+            std::string pot_str = "";
+            for (auto &g : groups) {
+                pot_str += stringf("%s%.0f", pot_str.empty() ? "" : ", ", g.curr_potential);
+            }
+            log_info("    potentials: [%s]\n", pot_str.c_str());
+        }
         log_info("   system potential: %f hpwl: %f\n", system_potential(), system_hpwl());
         compute_overlap();
         if ((iter % 10) == 0)
@@ -1167,6 +1241,7 @@ class StaticPlacer
         for (int i = 0; i < int(ccells.size()); i++) {
             auto &mc = mcells.at(i);
             auto &cc = ccells.at(i);
+            mc.solver_pos = mc.pos;
             if (dsp_bram && mc.group < 2)
                 continue;
             if (!dsp_bram && mc.group >= 2)
@@ -1190,6 +1265,18 @@ class StaticPlacer
         update_nets(true);
         float post_hpwl = system_hpwl();
         log_info("HPWL after legalise: %f (delta: %f)\n", post_hpwl, post_hpwl - pre_hpwl);
+        if (ctx->verbose) {
+            std::vector<float> disp_by_group(cfg.cell_groups.size());
+            for (int i = 0; i < int(ccells.size()); i++) {
+                auto &mc = mcells.at(i);
+                disp_by_group.at(mc.group) +=
+                        std::sqrt(std::pow(mc.pos.x - mc.solver_pos.x, 2) + std::pow(mc.pos.y - mc.solver_pos.y, 2));
+            }
+            log_info(" displacement by group: \n");
+            for (int i = 0; i < int(cfg.cell_groups.size()); i++) {
+                log_info("    %s %.0f\n", cfg.cell_groups.at(i).name.c_str(ctx), disp_by_group.at(i));
+            }
+        }
     }
 
     void enqueue_legalise(int cell_idx)
@@ -1245,7 +1332,7 @@ class StaticPlacer
             total_iters_noreset++;
             if (total_iters > int(ccells.size())) {
                 total_iters = 0;
-                ripup_radius = std::min(std::max(width + 1, height + 1), ripup_radius * 2);
+                ripup_radius = std::min(std::max(bel_width + 1, bel_height + 1), ripup_radius * 2);
             }
 
             if (total_iters_noreset > std::max(5000, 8 * int(ctx->cells.size()))) {
@@ -1260,11 +1347,13 @@ class StaticPlacer
                 // Pick a random X and Y location within our search radius
                 int cx, cy;
                 if (ci->udata == -1) {
-                    cx = width / 2;
-                    cy = height / 2;
+                    cx = bel_width / 2;
+                    cy = bel_height / 2;
                 } else {
                     cx = int(mcells.at(ci->udata).pos.x);
                     cy = int(mcells.at(ci->udata).pos.y);
+                    cx = place_x_to_bel_x.at(std::max(0, std::min(cx, width - 1)));
+                    cy = place_y_to_bel_y.at(std::max(0, std::min(cy, height - 1)));
                 }
                 int nx = ctx->rng(2 * rx + 1) + std::max(cx - rx, 0);
                 int ny = ctx->rng(2 * ry + 1) + std::max(cy - ry, 0);
@@ -1273,21 +1362,21 @@ class StaticPlacer
                 iter_at_radius++;
                 if (iter >= (10 * (radius + 1))) {
                     // No luck yet, increase radius
-                    radius = std::min(std::max(width + 1, height + 1), radius + 1);
-                    while (radius < std::max(width + 1, height + 1)) {
+                    radius = std::min(std::max(bel_width + 1, bel_height + 1), radius + 1);
+                    while (radius < std::max(bel_width + 1, bel_height + 1)) {
                         // Keep increasing the radius until it will actually increase the number of cells we are
                         // checking (e.g. BRAM and DSP will not be in all cols/rows), so we don't waste effort
-                        for (int x = std::max(0, cx - radius); x <= std::min(width + 1, cx + radius); x++) {
+                        for (int x = std::max(0, cx - radius); x <= std::min(bel_width + 1, cx + radius); x++) {
                             if (x >= int(fb->size()))
                                 break;
-                            for (int y = std::max(0, cy - radius); y <= std::min(height + 1, cy + radius); y++) {
+                            for (int y = std::max(0, cy - radius); y <= std::min(bel_height + 1, cy + radius); y++) {
                                 if (y >= int(fb->at(x).size()))
                                     break;
                                 if (fb->at(x).at(y).size() > 0)
                                     goto notempty;
                             }
                         }
-                        radius = std::min(std::max(width + 1, height + 1), radius + 1);
+                        radius = std::min(std::max(bel_width + 1, bel_height + 1), radius + 1);
                     }
                 notempty:
                     iter_at_radius = 0;
@@ -1295,9 +1384,9 @@ class StaticPlacer
                 }
                 // If our randomly chosen cooridnate is out of bounds; or points to a tile with no relevant bels; ignore
                 // it
-                if (nx < 0 || nx > width + 1)
+                if (nx < 0 || nx > bel_width + 1)
                     continue;
-                if (ny < 0 || ny > height + 1)
+                if (ny < 0 || ny > bel_height + 1)
                     continue;
 
                 if (nx >= int(fb->size()))
@@ -1320,7 +1409,7 @@ class StaticPlacer
                     }
                     ctx->bindBel(bestBel, ci, STRENGTH_WEAK);
                     placed = true;
-                    Loc loc = ctx->getBelLocation(bestBel);
+                    Loc loc = get_place_loc(ctx->getBelLocation(bestBel));
                     if (ci->udata != -1) {
                         auto &mc = mcells.at(ci->udata);
                         mc.pos = mc.ref_pos = RealPair(loc, 0.5);
@@ -1380,7 +1469,7 @@ class StaticPlacer
                                 // It's legal, and we've tried enough. Finish.
                                 if (bound != nullptr)
                                     enqueue_legalise(bound);
-                                Loc loc = ctx->getBelLocation(sz);
+                                Loc loc = get_place_loc(ctx->getBelLocation(sz));
                                 if (ci->udata != -1) {
                                     auto &mc = mcells.at(ci->udata);
                                     mc.pos = mc.ref_pos = RealPair(loc, 0.5);
@@ -1437,7 +1526,7 @@ class StaticPlacer
                             continue;
                         }
                         for (auto &target : targets) {
-                            Loc loc = ctx->getBelLocation(target.second);
+                            Loc loc = get_place_loc(ctx->getBelLocation(target.second));
                             if (ci->udata != -1) {
                                 auto &mc = mcells.at(target.first->udata);
                                 mc.pos = mc.ref_pos = RealPair(loc, 0.5);
@@ -1471,16 +1560,19 @@ class StaticPlacer
     void place()
     {
         log_info("Running Static placer...\n");
+        init_grid();
         init_bels();
         prepare_cells();
         init_cells();
         init_nets();
-        insert_dark();
+        // insert_dark();
         insert_spacer();
 
         prepare_density_bins();
         initialise();
         bool legalised_ip = false;
+        float best_overlap = 1.0;
+        int best_overlap_iter = 0;
         while (true) {
             step();
             for (auto &p : dens_penalty)
@@ -1506,7 +1598,11 @@ class StaticPlacer
                 float logic_overlap = 0;
                 for (int i = 0; i < cfg.logic_groups; i++)
                     logic_overlap = std::max(logic_overlap, groups.at(i).overlap);
-                if (logic_overlap < 0.1) {
+                if (logic_overlap < best_overlap) {
+                    best_overlap = logic_overlap;
+                    best_overlap_iter = iter;
+                }
+                if (logic_overlap < 0.1 || (logic_overlap < 0.2 && iter > (best_overlap_iter + 50))) {
                     legalise_step(false);
                     break;
                 }

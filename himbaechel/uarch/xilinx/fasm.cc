@@ -37,6 +37,15 @@
 #include "himbaechel_constids.h"
 
 NEXTPNR_NAMESPACE_BEGIN
+
+namespace Xc7MMCM {
+extern const uint16_t filter_lookup_low[];
+extern const uint16_t filter_lookup_low_ss[];
+extern const uint16_t filter_lookup_high[];
+extern const uint16_t filter_lookup_optimized[];
+extern const int64_t lk_table[];
+}; // namespace Xc7MMCM
+
 namespace {
 struct FasmBackend
 {
@@ -45,6 +54,8 @@ struct FasmBackend
     std::ostream &out;
     std::vector<std::string> fasm_ctx;
     dict<int, std::vector<PipId>> pips_by_tile;
+
+    dict<std::pair<int, int>, unsigned> lut_route_throughs;
 
     dict<IdString, pool<IdString>> invertible_pins;
 
@@ -255,8 +266,7 @@ struct FasmBackend
                     boost::erase_all(loc, "_T1");
                     boost::replace_all(loc, "IOI_OLOGIC", "OLOGIC_Y");
                     // the replacements transformed it into : LIOI3_X0Y73.OLOGIC_Y1
-                    out << loc << "."
-                        << "ZINV_T1" << std::endl;
+                    out << loc << "." << "ZINV_T1" << std::endl;
                 }
             }
             return;
@@ -608,59 +618,75 @@ struct FasmBackend
         bool is_slicem = is_mtile && (half == 0);
 
         const auto &lts = uarch->tile_status.at(tile).lts;
-        if (!lts)
-            return;
 
         push(tname);
         push(get_half_name(half, is_mtile));
 
-        BelId bel_in_half =
-                ctx->getBelByLocation(Loc(tile % ctx->chip_info->width, tile / ctx->chip_info->width, half << 6));
-
+        // Write route through pips
         for (int i = 0; i < 4; i++) {
-            CellInfo *lut6 = lts->cells[(half << 6) | (i << 4) | BEL_6LUT];
-            CellInfo *lut5 = lts->cells[(half << 6) | (i << 4) | BEL_5LUT];
-            // Write LUT initialisation
-            if (lut6 != nullptr || lut5 != nullptr) {
+            auto found_rt = lut_route_throughs.find(std::make_pair(tile, half * 4 + i));
+            if (found_rt != lut_route_throughs.end()) {
                 std::string lutname = stringf("%cLUT", "ABCD"[i]);
                 push(lutname);
-                write_vector("INIT[63:0]", get_lut_init(lut6, lut5));
-
-                // Write LUT mode config
-                bool is_small = false, is_ram = false, is_srl = false;
-                for (int j = 0; j < 2; j++) {
-                    CellInfo *lut = (j == 1) ? lut5 : lut6;
-                    if (lut == nullptr)
-                        continue;
-                    std::string type = str_or_default(lut->attrs, id_X_ORIG_TYPE);
-                    if (type == "RAMD64E" || type == "RAMS64E") {
-                        is_ram = true;
-                    } else if (type == "RAMD32" || type == "RAMS32") {
-                        is_ram = true;
-                        is_small = true;
-                    } else if (type == "SRL16E") {
-                        is_srl = true;
-                        is_small = true;
-                    } else if (type == "SRLC32E") {
-                        is_srl = true;
-                    }
-                    wa7_used |= (lut->getPort(id_WA7) != nullptr);
-                    wa8_used |= (lut->getPort(id_WA8) != nullptr);
+                std::vector<bool> rt_init(64, false);
+                for (unsigned b = 0; b < 64; b++) {
+                    if (b & (1U << found_rt->second))
+                        rt_init[b] = true;
                 }
-                if (is_slicem && i != 3) {
-                    write_routing_bel(get_site_wire(bel_in_half, stringf("%cDI1MUX_OUT", "ABCD"[i])));
-                }
-                write_bit("SMALL", is_small);
-                write_bit("RAM", is_ram);
-                write_bit("SRL", is_srl);
+                write_vector("INIT[63:0]", rt_init);
                 pop();
             }
-            write_routing_bel(get_site_wire(bel_in_half, stringf("%cMUX", "ABCD"[i])));
         }
-        write_bit("WA7USED", wa7_used);
-        write_bit("WA8USED", wa8_used);
-        if (is_slicem)
-            write_routing_bel(get_site_wire(bel_in_half, "WEMUX_OUT"));
+        if (lts) {
+            // Write logic
+            BelId bel_in_half =
+                    ctx->getBelByLocation(Loc(tile % ctx->chip_info->width, tile / ctx->chip_info->width, half << 6));
+
+            for (int i = 0; i < 4; i++) {
+                CellInfo *lut6 = lts->cells[(half << 6) | (i << 4) | BEL_6LUT];
+                CellInfo *lut5 = lts->cells[(half << 6) | (i << 4) | BEL_5LUT];
+                // Write LUT initialisation
+                if (lut6 != nullptr || lut5 != nullptr) {
+                    std::string lutname = stringf("%cLUT", "ABCD"[i]);
+                    push(lutname);
+                    write_vector("INIT[63:0]", get_lut_init(lut6, lut5));
+
+                    // Write LUT mode config
+                    bool is_small = false, is_ram = false, is_srl = false;
+                    for (int j = 0; j < 2; j++) {
+                        CellInfo *lut = (j == 1) ? lut5 : lut6;
+                        if (lut == nullptr)
+                            continue;
+                        std::string type = str_or_default(lut->attrs, id_X_ORIG_TYPE);
+                        if (type == "RAMD64E" || type == "RAMS64E") {
+                            is_ram = true;
+                        } else if (type == "RAMD32" || type == "RAMS32") {
+                            is_ram = true;
+                            is_small = true;
+                        } else if (type == "SRL16E") {
+                            is_srl = true;
+                            is_small = true;
+                        } else if (type == "SRLC32E") {
+                            is_srl = true;
+                        }
+                        wa7_used |= (lut->getPort(id_WA7) != nullptr);
+                        wa8_used |= (lut->getPort(id_WA8) != nullptr);
+                    }
+                    if (is_slicem && i != 3) {
+                        write_routing_bel(get_site_wire(bel_in_half, stringf("%cDI1MUX_OUT", "ABCD"[i])));
+                    }
+                    write_bit("SMALL", is_small);
+                    write_bit("RAM", is_ram);
+                    write_bit("SRL", is_srl);
+                    pop();
+                }
+                write_routing_bel(get_site_wire(bel_in_half, stringf("%cMUX", "ABCD"[i])));
+            }
+            write_bit("WA7USED", wa7_used);
+            write_bit("WA8USED", wa8_used);
+            if (is_slicem)
+                write_routing_bel(get_site_wire(bel_in_half, "WEMUX_OUT"));
+        }
 
         pop(2);
     }
@@ -696,6 +722,22 @@ struct FasmBackend
         for (auto &cell : ctx->cells) {
             if (uarch->is_logic_tile(cell.second->bel))
                 used_logic_tiles.insert(cell.second->bel.tile);
+        }
+        for (auto &net : ctx->nets) {
+            for (const auto &wire_pair : net.second->wires) {
+                PipId pip = wire_pair.second.pip;
+                if (pip == PipId())
+                    continue;
+                const auto &pip_data = chip_pip_info(ctx->chip_info, pip);
+                const auto &extra_data = *reinterpret_cast<const XlnxPipExtraDataPOD *>(pip_data.extra_data.get());
+                unsigned pip_type = pip_data.flags;
+                if (pip_type != PIP_LUT_ROUTETHRU)
+                    continue;
+                unsigned lut_idx = (extra_data.pip_config >> 8);
+                unsigned lut_input = (extra_data.pip_config >> 1) & 0x7;
+                lut_route_throughs[std::make_pair(pip.tile, lut_idx)] = lut_input;
+                used_logic_tiles.insert(pip.tile);
+            }
         }
         for (int tile : used_logic_tiles) {
             write_luts_config(tile, 0);
@@ -733,6 +775,8 @@ struct FasmBackend
 
     dict<int, BankIoConfig> ioconfig_by_hclk;
 
+    bool warned_dci = false;
+
     void write_io_config(CellInfo *pad)
     {
         NetInfo *pad_net = pad->getPort(id_PAD);
@@ -750,6 +794,13 @@ struct FasmBackend
                 is_input = true;
         std::string tile = uarch->tile_name(pad->bel.tile);
         push(tile);
+
+        if (boost::ends_with(iostandard, "_T_DCI")) {
+            if (!warned_dci)
+                log_warning("DCI is not supported, will be removed.\n");
+            warned_dci = true;
+            iostandard.erase(iostandard.size() - 6, iostandard.size());
+        }
 
         bool is_riob18 = boost::starts_with(tile, "RIOB18_");
         bool is_sing = boost::contains(tile, "_SING_");
@@ -930,6 +981,17 @@ struct FasmBackend
                 write_bit("SSTL12_SSTL135_SSTL15.IN");
         }
 
+        // IN_TERM.NONE and IN_ONLY for TMDS_33 output, e.g. HDMI signals
+        if (is_output && is_diff) {
+            if (is_tmds33 && yLoc == 1) {
+                if (pad->attrs.count(id_IN_TERM))
+                    write_bit("IN_TERM." + pad->attrs.at(id_IN_TERM).as_string());
+                else
+                    write_bit("IN_TERM.NONE");
+                write_bit("LVCMOS12_LVCMOS15_LVCMOS18_LVCMOS25_LVCMOS33_LVDS_25_LVTTL_SSTL135_SSTL15_TMDS_33.IN_ONLY");
+            }
+        }
+
         write_bit("PULLTYPE." + pulltype);
         pop(); // IOB_YN
 
@@ -1046,7 +1108,12 @@ struct FasmBackend
             write_bit("ODDR.DDR_CLK_EDGE.SAME_EDGE");
             write_bit("ODDR.SRUSED");
             write_bit("ODDR_TDDR.IN_USE");
-            write_bit("OQUSED", ci->getPort(id_OQ) != nullptr);
+
+            auto serdes_mode = str_or_default(ci->params, id_SERDES_MODE, "MASTER");
+            bool is_cascaded = (serdes_mode == "SLAVE");
+
+            // For cascaded OSERDESE2, OQUSED must be set even though OQ is not connected
+            write_bit("OQUSED", is_cascaded || ci->getPort(id_OQ));
             write_bit("ZINV_CLK", !bool_or_default(ci->params, id_IS_CLK_INVERTED, false));
             for (std::string t : {"T1", "T2", "T3", "T4"})
                 write_bit("ZINV_" + t, (ci->getPort(ctx->id(t)) != nullptr || t == "T1") &&
@@ -1062,7 +1129,7 @@ struct FasmBackend
             push("OSERDES");
             write_bit("IN_USE");
             std::string type = str_or_default(ci->params, id_DATA_RATE_OQ, "BUF");
-            write_bit(std::string("DATA_RATE_OQ.") + ((ci->getPort(id_OQ) != nullptr) ? type : "BUF"));
+            write_bit(std::string("DATA_RATE_OQ.") + ((ci->getPort(id_OQ) != nullptr) ? type : "DDR"));
             write_bit(std::string("DATA_RATE_TQ.") +
                       ((ci->getPort(id_TQ) != nullptr) ? str_or_default(ci->params, id_DATA_RATE_TQ, "BUF") : "BUF"));
             int width = int_or_default(ci->params, id_DATA_WIDTH, 8);
@@ -1084,6 +1151,8 @@ struct FasmBackend
 #endif
             write_bit("SRTYPE.SYNC");
             write_bit("TSRTYPE.SYNC");
+            if (is_cascaded)
+                write_bit("SERDES_MODE.SLAVE");
             pop();
         } else if (ci->type == id_ISERDESE2_ISERDESE2) {
             std::string data_rate = str_or_default(ci->params, id_DATA_RATE);
@@ -1204,6 +1273,8 @@ struct FasmBackend
                 pop(2);
             } else if (ci->type == id_PLLE2_ADV_PLLE2_ADV) {
                 write_pll(ci);
+            } else if (ci->type == id_MMCME2_ADV_MMCME2_ADV) {
+                write_mmcm(ci);
             }
             blank();
         }
@@ -1491,6 +1562,145 @@ struct FasmBackend
         pop(2);
     }
 
+    void write_mmcm_clkout(const std::string &name, CellInfo *ci)
+    {
+        // FIXME: variable duty cycle
+        int high = 1, low = 1, phasemux = 0, delaytime = 0, frac = 0;
+        bool no_count = false, edge = false;
+        double divide = float_or_default(
+                ci, name + ((name == "CLKFBOUT") ? "_MULT_F" : (name == "CLKOUT0" ? "_DIVIDE_F" : "_DIVIDE")), 1);
+        double phase = float_or_default(ci, name + "_PHASE", 1);
+        if (divide <= 1) {
+            no_count = true;
+        } else {
+            high = floor(divide / 2);
+            low = int(floor(divide) - high);
+            if (high != low)
+                edge = true;
+            if (name == "CLKOUT0" || name == "CLKFBOUT")
+                frac = floor(divide * 8) - floor(divide) * 8;
+            int phase_eights = floor((phase / 360) * divide * 8);
+            phasemux = phase_eights % 8;
+            delaytime = phase_eights / 8;
+        }
+        bool used = false;
+        if (name == "DIVCLK" || name == "CLKFBOUT") {
+            used = true;
+        } else {
+            used = ci->getPort(ctx->id(name)) != nullptr;
+        }
+        if (name == "DIVCLK") {
+            write_int_vector("DIVCLK_DIVCLK_HIGH_TIME[5:0]", high, 6);
+            write_int_vector("DIVCLK_DIVCLK_LOW_TIME[5:0]", low, 6);
+            write_bit("DIVCLK_DIVCLK_EDGE[0]", edge);
+            write_bit("DIVCLK_DIVCLK_NO_COUNT[0]", no_count);
+        } else if (used) {
+            auto is_clkout_5_or_6 = name == "CLKOUT5" || name == "CLKOUT6";
+            auto is_clkout0 = name == "CLKOUT0";
+            auto is_clkfbout = name == "CLKFBOUT";
+
+            if ((is_clkout0 || is_clkfbout) && frac != 0) {
+                --high;
+                --low;
+
+                auto frac_shifted = frac >> 1;
+                // CLKOUT0 controls CLKOUT5_CLKOUT2, CLKFBOUT controls CLKOUT6_CLKOUT2
+                std::string frac_conf_name = is_clkout0 ? "CLKOUT5_CLKOUT2_" : "CLKOUT6_CLKOUT2_";
+
+                if (1 <= frac_shifted) {
+                    write_bit(frac_conf_name + "FRACTIONAL_FRAC_WF_F[0]");
+                    write_int_vector(frac_conf_name + "FRACTIONAL_PHASE_MUX_F[1:0]", frac_shifted, 2);
+                }
+            }
+
+            write_bit(name + "_CLKOUT1_OUTPUT_ENABLE[0]");
+            write_int_vector(name + "_CLKOUT1_HIGH_TIME[5:0]", high, 6);
+            write_int_vector(name + "_CLKOUT1_LOW_TIME[5:0]", low, 6);
+
+            auto phase_mux_feature =
+                    name + (is_clkout_5_or_6 ? "_CLKOUT2_FRACTIONAL_PHASE_MUX_F[0]" : "_CLKOUT2_PHASE_MUX[0]");
+            write_int_vector(name + "_CLKOUT1_PHASE_MUX[2:0]", phasemux, 3);
+
+            auto edge_feature = name + (is_clkout_5_or_6 ? "_CLKOUT2_FRACTIONAL_EDGE[0]" : "_CLKOUT2_EDGE[0]");
+            write_bit(edge_feature, edge);
+
+            auto no_count_feature =
+                    name + (is_clkout_5_or_6 ? "_CLKOUT2_FRACTIONAL_NO_COUNT[0]" : "_CLKOUT2_NO_COUNT[0]");
+            write_bit(no_count_feature, no_count);
+
+            auto delay_time_feature =
+                    name + (is_clkout_5_or_6 ? "_CLKOUT2_FRACTIONAL_DELAY_TIME[5:0]" : "_CLKOUT2_DELAY_TIME[5:0]");
+            write_int_vector(delay_time_feature, delaytime, 6);
+
+            if (!is_clkout_5_or_6 && frac != 0) {
+                write_bit(name + "_CLKOUT2_FRAC_EN[0]", 1);
+                write_bit(name + "_CLKOUT2_FRAC_WF_R[0]", 1);
+                write_int_vector(name + "_CLKOUT2_FRAC[2:0]", frac, 3);
+            }
+        }
+    }
+
+    // From openXC7
+    void write_mmcm(CellInfo *ci)
+    {
+        push(uarch->tile_name(ci->bel.tile));
+        push("MMCME2_ADV");
+        write_bit("IN_USE");
+        // FIXME: should be INV not ZINV (XRay error?)
+        write_bit("ZINV_PWRDWN", bool_or_default(ci->params, id_IS_PWRDWN_INVERTED, false));
+        write_bit("ZINV_RST", bool_or_default(ci->params, id_IS_RST_INVERTED, false));
+        write_bit("ZINV_PSEN", bool_or_default(ci->params, id_IS_PSEN_INVERTED, false));
+        write_bit("ZINV_PSINCDEC", bool_or_default(ci->params, id_IS_PSINCDEC_INVERTED, false));
+        write_bit("INV_CLKINSEL", bool_or_default(ci->params, id_IS_CLKINSEL_INVERTED, false));
+        write_mmcm_clkout("DIVCLK", ci);
+        write_mmcm_clkout("CLKFBOUT", ci);
+        write_mmcm_clkout("CLKOUT0", ci);
+        write_mmcm_clkout("CLKOUT1", ci);
+        write_mmcm_clkout("CLKOUT2", ci);
+        write_mmcm_clkout("CLKOUT3", ci);
+        write_mmcm_clkout("CLKOUT4", ci);
+        write_mmcm_clkout("CLKOUT5", ci);
+        write_mmcm_clkout("CLKOUT6", ci);
+
+        std::string comp = str_or_default(ci->params, id_COMPENSATION, "INTERNAL");
+        push("COMP");
+        if (comp == "INTERNAL" || comp == "ZHOLD") {
+            // does not seem to make a difference in vivado
+            // both modes set this bit
+            write_bit("Z_ZHOLD");
+        } else {
+            log_error("unsupported COMPENSATION type '%s' for MMCM (supported compensation types: INTERNAL, ZHOLD)\n",
+                      comp.c_str());
+        }
+        pop();
+
+        auto clkfbout_mult = (int)float_or_default(ci, "CLKFBOUT_MULT_F", 5.000);
+        if (63 < clkfbout_mult)
+            log_error("MMCME2_ADV: CLKFBOUT_MULT_F must not be greater than 63");
+        if (0 == clkfbout_mult)
+            log_error("MMCME2_ADV: CLKFBOUT_MULT_F must not be 0");
+        write_int_vector("LKTABLE[39:0]", Xc7MMCM::lk_table[clkfbout_mult - 1], 40);
+
+        std::string bandwidth = str_or_default(ci->params, id_BANDWIDTH, "OPTIMIZED");
+        const uint16_t *filter_lookup;
+        if (bandwidth == "LOW")
+            filter_lookup = Xc7MMCM::filter_lookup_low;
+        else if (bandwidth == "LOW_SS")
+            filter_lookup = Xc7MMCM::filter_lookup_low_ss;
+        else if (bandwidth == "HIGH")
+            filter_lookup = Xc7MMCM::filter_lookup_high;
+        else
+            filter_lookup = Xc7MMCM::filter_lookup_optimized;
+        write_int_vector("FILTREG1_RESERVED[11:0]", filter_lookup[clkfbout_mult - 1], 12);
+
+        // 0x9900 enables fractional counters
+        // only int counters would be 0x1 << 8
+        // 0xffff enables everything, I suppose, this is what is used in xap888
+        write_int_vector("POWER_REG_POWER_REG_POWER_REG[15:0]", 0xffff, 16);
+        write_bit("LOCKREG3_RESERVED[0]");
+        write_int_vector("TABLE[9:0]", 0x3d4, 10);
+        pop(2);
+    }
     void write_dsp_cell(CellInfo *ci)
     {
         auto tile_name = uarch->tile_name(ci->bel.tile);
@@ -1645,9 +1855,7 @@ struct FasmBackend
 
 void XilinxImpl::write_fasm(const std::string &filename)
 {
-    std::ofstream out(filename);
-    if (!out)
-        log_error("failed to open file %s for writing (%s)\n", filename.c_str(), strerror(errno));
+    auto out = open_ofstream_and_log_error(filename, "FASM file");
 
     FasmBackend be(this->ctx, this, out);
     be.write_fasm();

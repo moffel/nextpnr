@@ -97,16 +97,44 @@ struct FabulousPacker
 
     void prepare_ffs()
     {
+        // The following LUTFF are supported:
+        // Enable before reset: LUTFF_[N][E][AS|AR|SS|SR]
+        // Reset before enable: LUTFF_[N][AS|AR|SS|SR][E]
+
+        // Note: A simple LUTFF will have SR and EN disconnected,
+        //       ensure that the default value is SR=0 and EN=1.
+
+        // N  ... clock inversion (NEG_CLK=1)
+        // E  ... clock enable    (EN port)
+        // AS ... async set       (SET_NORESET=1, ASYNC_SR=1)
+        // AR ... async reset     (SET_NORESET=0, ASYNC_SR=1)
+        // SS ... sync set        (SET_NORESET=1, ASYNC_SR=0)
+        // SR ... sync reset      (SET_NORESET=0, ASYNC_SR=0)
+
+        // The ports of FABULOUS_FF are:
+        // - CLK: clock
+        // - SR: set/reset
+        // - EN: enable
+
+        // The parameters of FABULOUS_FF are:
+        // - SET_NORESET: the value to load into the flip-flop when SR=1
+        // - ASYNC_SR: used to indicate asynchronous load
+        // - NEG_CLK: invert the clock
+
+        // Note: Both ASYNC_SR and NEG_CLK are currently unused by the default FABulous fabric.
+
         for (auto &cell : ctx->cells) {
             CellInfo *ci = cell.second.get();
             const std::string &type_str = ci->type.str(ctx);
             if (type_str.size() < 5 || type_str.substr(0, 5) != "LUTFF")
                 continue;
             ci->type = id_FABULOUS_FF;
+
             // parse config string and unify
             size_t idx = 5;
             if (idx < type_str.size() && type_str.at(idx) == '_')
                 ++idx;
+
             // clock inversion
             if (idx < type_str.size() && type_str.at(idx) == 'N') {
                 ci->params[id_NEG_CLK] = 1;
@@ -114,36 +142,70 @@ struct FabulousPacker
             } else {
                 ci->params[id_NEG_CLK] = 0;
             }
-            // clock enable
+
+            // clock enable (enable before reset)
             if (idx < type_str.size() && type_str.at(idx) == 'E')
                 ++idx;
-            if (ci->ports.count(id_E))
-                ci->renamePort(id_E, id_EN);
-            else
-                ci->addInput(id_EN); // autocreate emtpy enable port if enable missing or unused
-            // sr presence and type
-            std::string srt = type_str.substr(idx);
-            if (srt == "S") {
-                ci->params[id_SET_NORESET] = 1;
-                ci->params[id_ASYNC_SR] = 1;
-            } else if (srt == "R") {
-                ci->params[id_SET_NORESET] = 0;
-                ci->params[id_ASYNC_SR] = 1;
-            } else if (srt == "SS") {
+
+            // default settings
+            ci->params[id_SET_NORESET] = 0;
+            ci->params[id_ASYNC_SR] = 0;
+
+            // synchronous set
+            if (idx < type_str.size() - 1 && type_str.substr(idx, 2) == "SS") {
                 ci->params[id_SET_NORESET] = 1;
                 ci->params[id_ASYNC_SR] = 0;
-            } else if (srt == "SR" || srt == "") {
+                idx += 2;
+            }
+
+            // synchronous reset
+            if (idx < type_str.size() - 1 && type_str.substr(idx, 2) == "SR") {
                 ci->params[id_SET_NORESET] = 0;
                 ci->params[id_ASYNC_SR] = 0;
-            } else {
+                idx += 2;
+            }
+
+            // asynchronous set
+            if (idx < type_str.size() - 1 && type_str.substr(idx, 2) == "AS") {
+                ci->params[id_SET_NORESET] = 1;
+                ci->params[id_ASYNC_SR] = 1;
+                idx += 2;
+            }
+
+            // asynchronous reset
+            if (idx < type_str.size() - 1 && type_str.substr(idx, 2) == "AR") {
+                ci->params[id_SET_NORESET] = 0;
+                ci->params[id_ASYNC_SR] = 1;
+                idx += 2;
+            }
+
+            // clock enable (reset before enable)
+            if (idx < type_str.size() && type_str.at(idx) == 'E')
+                ++idx;
+
+            // check that we are the end of the string
+            if (idx != type_str.size()) {
+                log_error("unhandled FF type %s of cell %s\n", type_str.c_str(), ci->name.c_str(ctx));
                 NPNR_ASSERT_FALSE("unhandled FF type");
             }
+
+            // Rename S/R ports to SR
             if (ci->ports.count(id_S))
                 ci->renamePort(id_S, id_SR);
             else if (ci->ports.count(id_R))
                 ci->renamePort(id_R, id_SR);
+
+            // Rename E port to EN
+            if (ci->ports.count(id_E))
+                ci->renamePort(id_E, id_EN);
+
+            // autocreate empty set/reset port if enable missing or unused
             if (!ci->ports.count(id_SR))
-                ci->addInput(id_SR); // autocreate emtpy enable port if enable missing or unused
+                ci->addInput(id_SR);
+
+            // autocreate empty enable port if enable missing or unused
+            if (!ci->ports.count(id_EN))
+                ci->addInput(id_EN);
         }
     }
 
@@ -323,12 +385,67 @@ struct FabulousPacker
 
     void handle_io()
     {
-        // As per the preferred approach for new nextpnr flows, we require IO to be inserted by Yosys
-        // pre-place-and-route, or just manually instantiated
-        const pool<CellTypePort> top_ports{
-                CellTypePort(id_IO_1_bidirectional_frame_config_pass, id_PAD),
-        };
-        h.remove_nextpnr_iobs(top_ports);
+        // Any remaining $nextpnr_*buf cells were not constrained via PCF.
+        // Verify each connects to an IO cell via PAD, then remove it.
+        IdString ibuf = ctx->id("$nextpnr_ibuf");
+        IdString obuf = ctx->id("$nextpnr_obuf");
+        IdString iobuf = ctx->id("$nextpnr_iobuf");
+
+        std::vector<IdString> to_remove;
+        for (auto &cell : ctx->cells) {
+            auto &ci = *cell.second;
+            if (!ci.type.in(ibuf, obuf, iobuf))
+                continue;
+            bool found_pad = false;
+            bool constrained = false;
+            for (auto &port : ci.ports) {
+                NetInfo *net = port.second.net;
+                if (!net)
+                    continue;
+
+                for (auto &usr : net->users) {
+                    if (usr.cell == &ci)
+                        continue;
+                    if (usr.port != id_PAD)
+                        log_error("Top-level port '%s' connected to illegal port %s.%s (must be PAD)\n",
+                                  ctx->nameOf(&ci), ctx->nameOf(usr.cell), ctx->nameOf(usr.port));
+                    if (usr.cell->attrs.count(id_BEL))
+                        constrained = true;
+                    if (found_pad)
+                        log_error("Top-level port '%s' connected to multiple PAD ports (at least %s.%s and %s.%s)\n",
+                                  ctx->nameOf(&ci), ctx->nameOf(usr.cell), ctx->nameOf(usr.port),
+                                  ctx->nameOf(net->driver.cell), ctx->nameOf(net->driver.port));
+                    found_pad = true;
+                }
+
+                if (found_pad)
+                    continue;
+
+                auto &drv = net->driver;
+                if (drv.cell && drv.cell != &ci) {
+                    if (drv.port != id_PAD)
+                        log_error("Top-level port '%s' connected to illegal port %s.%s (must be PAD)\n",
+                                  ctx->nameOf(&ci), ctx->nameOf(drv.cell), ctx->nameOf(drv.port));
+                    if (drv.cell->attrs.count(id_BEL))
+                        constrained = true;
+                    if (found_pad)
+                        log_error("Top-level port '%s' connected to multiple PAD ports (at least %s.%s and %s.%s)\n",
+                                  ctx->nameOf(&ci), ctx->nameOf(drv.cell), ctx->nameOf(drv.port),
+                                  ctx->nameOf(net->driver.cell), ctx->nameOf(net->driver.port));
+                    found_pad = true;
+                }
+            }
+            if (!found_pad)
+                log_error("No IO cell found connected to '%s' via PAD port. Was iopadmap run in Yosys?\n",
+                          ctx->nameOf(&ci));
+            if (!constrained)
+                log_info("port is unconstrained: %s This pin will be assigned randomly\n", ctx->nameOf(&ci));
+            ci.disconnectPort(id_I);
+            ci.disconnectPort(id_O);
+            to_remove.push_back(ci.name);
+        }
+        for (IdString cell_name : to_remove)
+            ctx->cells.erase(cell_name);
     }
 
     void constrain_carries()

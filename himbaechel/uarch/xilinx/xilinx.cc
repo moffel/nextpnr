@@ -27,6 +27,8 @@
 #include "util.h"
 
 #include "placer_heap.h"
+#include "placer_static.h"
+
 #include "xilinx.h"
 
 #include "himbaechel_helpers.h"
@@ -36,6 +38,30 @@
 #include "himbaechel_constids.h"
 
 NEXTPNR_NAMESPACE_BEGIN
+
+struct FFControlSet
+{
+    unsigned flags = 0;
+    enum
+    {
+        IS_LATCH = 1,
+        IS_CLKINV = 2,
+        IS_SRINV = 4,
+        FFSYNC = 8,
+    };
+    IdString clk, sr, ce;
+    bool operator==(const FFControlSet &other) const
+    {
+        return flags == other.flags && clk == other.clk && ce == other.ce && sr == other.sr;
+    };
+    unsigned hash() const
+    {
+        unsigned hash = mkhash(clk.hash(), sr.hash());
+        hash = mkhash(hash, ce.hash());
+        hash = mkhash(hash, flags);
+        return hash;
+    }
+};
 
 XilinxImpl::~XilinxImpl() {};
 
@@ -134,6 +160,13 @@ void XilinxImpl::notifyBelChange(BelId bel, CellInfo *cell)
     if (cell && cell->type != id_PAD && site_key.site >= 0 && site_key.site < int(ts.site_variant.size())) {
         ts.site_variant.at(site_key.site) = site_key.site_variant;
     }
+
+    if (!cell_tags_set) {
+        // This will happen when loading a pre-placed design, at the time the frontend calls attributesToArchInfo cell
+        // tags aren't set and this will fail. We resolve it in preRoute
+        return;
+    }
+
     if (is_logic_tile(bel))
         update_logic_bel(bel, cell);
     if (is_bram_tile(bel))
@@ -272,7 +305,12 @@ bool XilinxImpl::is_pip_unavail(PipId pip) const
     return false;
 }
 
-void XilinxImpl::prePlace() { assign_cell_tags(); }
+void XilinxImpl::prePlace()
+{
+    assign_cell_tags();
+    index_control_sets();
+    cell_tags_set = true;
+}
 
 void XilinxImpl::postPlace()
 {
@@ -293,10 +331,130 @@ void XilinxImpl::configurePlacerHeap(PlacerHeapCfg &cfg)
         // Place memory first, because they require entire SLICEMs
         return tags->lut.is_memory ? 100 : 1;
     };
+
+    cfg.ff_bel_bucket = id_SLICE_FFX;
+    cfg.ff_control_set_groups.resize(2);
+    for (int z = 0; z < 8; z++) {
+        cfg.ff_control_set_groups.at(z / 4).push_back((z << 4) | BEL_FF);
+        cfg.ff_control_set_groups.at(z / 4).push_back((z << 4) | BEL_FF2);
+    }
+    cfg.ctrl_set_max_radius = std::vector<int>{18, 15, 12, 9, 6, 3};
+
+    cfg.get_cell_control_set = [this](Context *, const CellInfo *ci) {
+        if (ci->type != id_SLICE_FFX)
+            return -1;
+        auto tags = get_tags(ci);
+        return tags->ff.control_set;
+    };
+}
+
+void XilinxImpl::configurePlacerStatic(PlacerStaticCfg &cfg)
+{
+    cfg.hpwl_scale_x = 2;
+    cfg.hpwl_scale_y = 1;
+
+    cfg.glbBufTypes.insert(id_PSEUDO_GND);
+    cfg.glbBufTypes.insert(id_PSEUDO_VCC);
+    cfg.glbBufTypes.insert(id_BUFGCTRL);
+    cfg.glbBufTypes.insert(id_BUFG_BUFG);
+
+    cfg.timing_c = 500;
+    cfg.timing_mx = 25;
+    cfg.timing_my = 50;
+
+    {
+        cfg.cell_groups.emplace_back();
+        auto &comb = cfg.cell_groups.back();
+        comb.name = ctx->id("COMB");
+        comb.bel_area[id_SLICE_LUTX] = StaticRect(1.0f, 0.0625f);
+        comb.bel_area[id_CARRY4] = StaticRect(0.0f, 0.0f);
+        comb.bel_area[id_SELMUX2_1] = StaticRect(0.0f, 0.0f);
+
+        comb.cell_area[id_SLICE_LUTX] = StaticRect(1.0f, 0.125f);
+        comb.cell_area[id_CARRY4] = StaticRect(1.0f, 0.5f);
+        comb.cell_area[id_SELMUX2_1] = StaticRect(1.0f, 0.125f);
+
+        comb.zero_area_cells.insert(id_CARRY4);
+        comb.zero_area_cells.insert(id_SELMUX2_1);
+
+        comb.spacer_rect = StaticRect(1.0f, 0.125f);
+    }
+
+    {
+        cfg.cell_groups.emplace_back();
+        auto &comb = cfg.cell_groups.back();
+        comb.name = ctx->id("FF");
+        // Assume one FF occupies 1.5 bels due to control set packing and slice input restrictions
+        comb.cell_area[id_SLICE_FFX] = StaticRect(1.0f, 0.0875f);
+        comb.bel_area[id_SLICE_FFX] = StaticRect(1.0f, 0.0625f);
+        comb.spacer_rect = StaticRect(1.0f, 0.125f);
+    }
+
+    {
+        cfg.cell_groups.emplace_back();
+        auto &comb = cfg.cell_groups.back();
+        comb.name = ctx->id("RAM");
+        comb.cell_area[id_RAMB18E1_RAMB18E1] = StaticRect(1.0f, 3.0f);
+        comb.bel_area[id_RAMB18E1_RAMB18E1] = StaticRect(1.0f, 3.0f);
+        comb.cell_area[id_RAMB36E1_RAMB36E1] = StaticRect(1.0f, 6.0f);
+        comb.bel_area[id_RAMB36E1_RAMB36E1] = StaticRect(0.0f, 0.0f);
+        comb.spacer_rect = StaticRect(1.0f, 3.0f);
+    }
+    {
+        cfg.cell_groups.emplace_back();
+        auto &comb = cfg.cell_groups.back();
+        comb.name = ctx->id("DSP");
+        comb.cell_area[id_DSP48E1_DSP48E1] = StaticRect(1.0f, 3.0f);
+        comb.bel_area[id_DSP48E1_DSP48E1] = StaticRect(1.0f, 3.0f);
+        comb.spacer_rect = StaticRect(1.0f, 3.0f);
+    }
+    cfg.get_cell_area_override = [this](Context *ctx, const CellInfo *ci) -> std::optional<StaticRect> {
+        if (ci->type != id_SLICE_LUTX)
+            return {};
+        auto tags = get_tags(ci);
+        if (tags->lut.is_memory ||
+            (ci->cluster != ClusterId() && ctx->getClusterRootCell(ci->cluster)->type == id_CARRY4)) {
+            // macro LUTs use either a half or whole LUT, always
+            return {(tags->lut.input_count == 6) ? StaticRect(1.0f, 0.125f) : StaticRect(1.0f, 0.0625f)};
+        } else {
+            switch (tags->lut.input_count) { // sliding scale, smaller LUTs pack better
+            case 6:
+                return {StaticRect(1.0f, 0.125f)};
+            case 5:
+                return {StaticRect(1.0f, 0.125f)};
+            case 4:
+                return {StaticRect(1.0f, 0.1f)};
+            case 3:
+                return {StaticRect(1.0f, 0.08f)};
+            case 2:
+                return {StaticRect(1.0f, 0.06f)};
+            case 1:
+                return {StaticRect(1.0f, 0.04f)};
+            default:
+                NPNR_ASSERT_FALSE("unhandled LUT input count");
+            }
+        }
+    };
 }
 
 void XilinxImpl::preRoute()
 {
+    if (!cell_tags_set) {
+        // We loaded a pre-placed design. Need to set tags and update bel-cell map
+        assign_cell_tags();
+        index_control_sets();
+        cell_tags_set = true;
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            notifyBelChange(ci->bel, ci);
+        }
+        if (ctx->nets.count(ctx->id("$PACKER_GND_NET"))) {
+            ctx->nets.at(ctx->id("$PACKER_GND_NET"))->constant_value = id_GND;
+        }
+        if (ctx->nets.count(ctx->id("$PACKER_VCC_NET"))) {
+            ctx->nets.at(ctx->id("$PACKER_VCC_NET"))->constant_value = id_VCC;
+        }
+    }
     find_source_sink_locs();
     route_clocks();
 }
@@ -338,6 +496,18 @@ Loc XilinxImpl::rel_site_loc(SiteIndex site) const
 {
     const auto &site_data = tile_extra_data(site.tile)->sites[site.site];
     return Loc(site_data.rel_x, site_data.rel_y, 0);
+}
+
+SiteIndex XilinxImpl::rel_site(SiteIndex site, int dx, int dy) const
+{
+    const auto &base_site_data = tile_extra_data(site.tile)->sites[site.site];
+    for (size_t i = 0; i < tile_extra_data(site.tile)->sites.size(); i++) {
+        const auto &site_data = tile_extra_data(site.tile)->sites[i];
+        if (site_data.name_prefix == base_site_data.name_prefix && site_data.rel_x == (base_site_data.rel_x + dx) &&
+            site_data.rel_y == (base_site_data.rel_y + dy))
+            return SiteIndex(site.tile, i);
+    }
+    return SiteIndex();
 }
 
 int XilinxImpl::hclk_for_iob(BelId pad) const
@@ -429,8 +599,39 @@ void XilinxImpl::assign_cell_tags()
                 ct.carry.x_sigs[i] = nullptr;
             }
             ct.carry.x_sigs[0] = ci->getPort(id_CYINIT);
+        } else if (ci->type == id_RAMB18E1_RAMB18E1 || ci->type == id_RAMB36E1_RAMB36E1) {
+            bool read_sdp = ((ci->type == id_RAMB18E1_RAMB18E1 &&
+                              int_or_default(ci->params, ctx->id("READ_WIDTH_B"), 0) == 36) ||
+                             (ci->type == id_RAMB36E1_RAMB36E1 &&
+                              int_or_default(ci->params, ctx->id("READ_WIDTH_B"), 0) == 72));
+            bool write_sdp = ((ci->type == id_RAMB18E1_RAMB18E1 &&
+                               int_or_default(ci->params, ctx->id("WRITE_WIDTH_B"), 0) == 36) ||
+                              (ci->type == id_RAMB36E1_RAMB36E1 &&
+                               int_or_default(ci->params, ctx->id("WRITE_WIDTH_B"), 0) == 72));
+            ci->timing_index = ctx->get_cell_timing_idx(
+                    ctx->idf("%s_%s_%s", ci->type.c_str(ctx), write_sdp ? "WSDP" : "WTDP", read_sdp ? "RSDP" : "RTDP"));
         }
     }
+}
+
+void XilinxImpl::index_control_sets()
+{
+    idict<FFControlSet> control_sets;
+    for (auto &cell : ctx->cells) {
+        CellInfo *ci = cell.second.get();
+        if (ci->type == id_SLICE_FFX) {
+            auto &ct = cell_tags.at(ci->flat_index);
+            FFControlSet ctrl_set;
+            ctrl_set.clk = ct.ff.clk ? ct.ff.clk->name : IdString();
+            ctrl_set.ce = ct.ff.ce ? ct.ff.ce->name : IdString();
+            ctrl_set.sr = ct.ff.sr ? ct.ff.sr->name : IdString();
+            ctrl_set.flags = (ct.ff.is_clkinv ? FFControlSet::IS_CLKINV : 0) |
+                             (ct.ff.is_srinv ? FFControlSet::IS_SRINV : 0) |
+                             (ct.ff.is_latch ? FFControlSet::IS_LATCH : 0) | (ct.ff.ffsync ? FFControlSet::FFSYNC : 0);
+            ct.ff.control_set = control_sets(ctrl_set);
+        }
+    }
+    log_info("Indexed %d control sets.\n", int(control_sets.size()));
 }
 
 bool XilinxImpl::is_general_routing(WireId wire) const
@@ -540,14 +741,42 @@ delay_t XilinxImpl::estimateDelay(WireId src, WireId dst) const
     if (fnd_src != source_locs.end()) {
         sx = fnd_src->second.x;
         sy = fnd_src->second.y;
+    } else {
+        auto src_type = ctx->getWireType(src);
+        if (src_type.in(id_DOUBLE, id_BENTQUAD, id_HQUAD, id_VQUAD)) {
+            for (auto pip : ctx->getPipsDownhill(src)) {
+                tile_xy(ctx->chip_info, pip.tile, sx, sy);
+                break;
+            }
+        }
     }
     auto fnd_snk = sink_locs.find(dst);
     if (fnd_snk != sink_locs.end()) {
         dx = fnd_snk->second.x;
         dy = fnd_snk->second.y;
+    } else {
+        auto dst_type = ctx->getWireType(dst);
+        if (dst_type.in(id_DOUBLE, id_BENTQUAD, id_HQUAD, id_VQUAD)) {
+            for (auto pip : ctx->getPipsUphill(dst)) {
+                tile_xy(ctx->chip_info, pip.tile, dx, dy);
+                break;
+            }
+        }
     }
+
     // TODO: improve sophistication here based on old nextpnr-xilinx code
-    return 800 + 50 * (std::abs(dy - sy) + std::abs(dx - sx));
+    int dist_x = std::abs(dx - sx), dist_y = std::abs(dy - sy);
+    return 500 + 12 * (2 * std::max(dist_y - 6, 0) + 4 * std::min(dist_y, 6) + std::max(dist_x - 12, 0) +
+                       2 * std::min(dist_x, 12));
+}
+
+delay_t XilinxImpl::predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const
+{
+    int sx, sy, dx, dy;
+    tile_xy(ctx->chip_info, src_bel.tile, sx, sy);
+    tile_xy(ctx->chip_info, dst_bel.tile, dx, dy);
+    // TODO: improve sophistication here based on old nextpnr-xilinx code
+    return 500 + 25 * (2 * std::abs(dy - sy) + std::abs(dx - sx));
 }
 
 BoundingBox XilinxImpl::getRouteBoundingBox(WireId src, WireId dst) const

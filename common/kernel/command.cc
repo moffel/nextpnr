@@ -363,7 +363,6 @@ po::options_description CommandHandler::getGeneralOptions()
                         "; default: " + Arch::defaultRouter)
                     .c_str());
 
-    general.add_options()("slack_redist_iter", po::value<int>(), "number of iterations between slack redistribution");
     general.add_options()("cstrweight", po::value<float>(), "placer weighting for relative constraint satisfaction");
     general.add_options()("starttemp", po::value<float>(), "placer SA start temperature");
 
@@ -395,6 +394,8 @@ po::options_description CommandHandler::getGeneralOptions()
     general.add_options()("placer-heap-cell-placement-timeout", po::value<int>(),
                           "allow placer to attempt up to max(10000, total cells^2 / N) iterations to place a cell (int "
                           "N, default: 8, 0 for no timeout)");
+
+    general.add_options()("placer-heap-no-ctrl-set", "disable control set awareness in placer heap");
 
     general.add_options()("static-dump-density", "write density csv files during placer-static flow");
 
@@ -468,17 +469,6 @@ void CommandHandler::setupContext(Context *ctx)
         log_info("Generated random seed: %" PRIu64 "\n", seed);
     }
 
-    if (vm.count("slack_redist_iter")) {
-        ctx->settings[ctx->id("slack_redist_iter")] = vm["slack_redist_iter"].as<int>();
-        if (vm.count("freq") && vm["freq"].as<double>() == 0) {
-            ctx->settings[ctx->id("auto_freq")] = true;
-#ifndef NO_GUI
-            if (!vm.count("gui"))
-#endif
-                log_warning("Target frequency not specified. Will optimise for max frequency.\n");
-        }
-    }
-
     if (vm.count("ignore-loops")) {
         ctx->settings[ctx->id("timing/ignoreLoops")] = true;
     }
@@ -541,6 +531,9 @@ void CommandHandler::setupContext(Context *ctx)
         ctx->settings[ctx->id("placerHeap/cellPlacementTimeout")] =
                 std::to_string(std::max(0, vm["placer-heap-cell-placement-timeout"].as<int>()));
 
+    if (vm.count("placer-heap-no-ctrl-set"))
+        ctx->settings[ctx->id("placerHeap/noCtrlSet")] = true;
+
     if (vm.count("parallel-refine"))
         ctx->settings[ctx->id("placerHeap/parallelRefine")] = true;
 
@@ -560,8 +553,6 @@ void CommandHandler::setupContext(Context *ctx)
         ctx->settings[ctx->id("target_freq")] = std::to_string(12e6);
     if (ctx->settings.find(ctx->id("timing_driven")) == ctx->settings.end())
         ctx->settings[ctx->id("timing_driven")] = true;
-    if (ctx->settings.find(ctx->id("slack_redist_iter")) == ctx->settings.end())
-        ctx->settings[ctx->id("slack_redist_iter")] = 0;
     if (ctx->settings.find(ctx->id("auto_freq")) == ctx->settings.end())
         ctx->settings[ctx->id("auto_freq")] = false;
     if (ctx->settings.find(ctx->id("placer")) == ctx->settings.end())
@@ -609,14 +600,14 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
         try {
             if (vm.count("json")) {
                 std::string filename = vm["json"].as<std::string>();
-                std::ifstream f(filename);
+                auto f = open_ifstream_and_log_error(filename, "JSON file");
                 if (!parse_json(f, filename, w.getContext()))
                     log_error("Loading design failed.\n");
 
                 if (vm.count("sdc")) {
                     std::string sdc_filename = vm["sdc"].as<std::string>();
-                    std::ifstream sdc_stream(sdc_filename);
-                    ctx->read_sdc(sdc_stream);
+                    auto sdc_stream = open_ifstream_and_log_error(sdc_filename, "SDC file");
+                    w.getContext()->read_sdc(sdc_stream);
                 }
 
                 customAfterLoad(w.getContext());
@@ -635,13 +626,14 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
 #endif
     if (vm.count("json")) {
         std::string filename = vm["json"].as<std::string>();
-        std::ifstream f(filename);
+        auto f = open_ifstream_and_log_error(filename, "'--json' file");
+
         if (!parse_json(f, filename, ctx.get()))
             log_error("Loading design failed.\n");
 
         if (vm.count("sdc")) {
             std::string sdc_filename = vm["sdc"].as<std::string>();
-            std::ifstream sdc_stream(sdc_filename);
+            auto sdc_stream = open_ifstream_and_log_error(sdc_filename, "SDC file");
             ctx->read_sdc(sdc_stream);
         }
 
@@ -703,24 +695,20 @@ int CommandHandler::executeMain(std::unique_ptr<Context> ctx)
 
     if (vm.count("write")) {
         std::string filename = vm["write"].as<std::string>();
-        std::ofstream f(filename);
+        auto f = open_ofstream_and_log_error(filename, "JSON '--write' file");
         if (!write_json_file(f, filename, ctx.get()))
             log_error("Saving design failed.\n");
     }
 
     if (vm.count("sdf")) {
         std::string filename = vm["sdf"].as<std::string>();
-        std::ofstream f(filename);
-        if (!f)
-            log_error("Failed to open SDF file '%s' for writing.\n", filename.c_str());
+        auto f = open_ofstream_and_log_error(filename, "SDF file");
         ctx->writeSDF(f, vm.count("sdf-cvc"));
     }
 
     if (vm.count("report")) {
         std::string filename = vm["report"].as<std::string>();
-        std::ofstream f(filename);
-        if (!f)
-            log_error("Failed to open report file '%s' for writing.\n", filename.c_str());
+        auto f = open_ofstream_and_log_error(filename, "report file");
         ctx->writeJsonReport(f);
     }
 
@@ -753,7 +741,7 @@ int CommandHandler::exec()
 {
     try {
         if (!parseOptions())
-            return -1;
+            return 125;
 
         if (executeBeforeContext())
             return 0;
@@ -769,7 +757,7 @@ int CommandHandler::exec()
         return rc;
     } catch (log_execution_error_exception) {
         printFooter();
-        return -1;
+        return 125;
     }
 }
 
@@ -778,7 +766,7 @@ void CommandHandler::load_json(Context *ctx, std::string filename)
     setupContext(ctx);
     setupArchContext(ctx);
     {
-        std::ifstream f(filename);
+        auto f = open_ifstream_and_log_error(filename, "JSON file");
         if (!parse_json(f, filename, ctx))
             log_error("Loading design failed.\n");
     }

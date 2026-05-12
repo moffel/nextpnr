@@ -70,8 +70,8 @@ static const DefaultParam serdes_defaults[] = {
         {id_RX_AFE_VCMSEL, 3, 4},
         {id_RX_CDR_CKP, 8, 0xF8},
         {id_RX_CDR_CKI, 8, 0},
-        {id_RX_CDR_TRANS_TH, 9, 128},
-        {id_RX_CDR_LOCK_CFG, 6, 0x0B},
+        {id_RX_CDR_TRANS_TH, 7, 0x08},
+        {id_RX_CDR_LOCK_CFG, 8, 0xD5},
         // { id_RX_CDR_LOCKED, 1, 0 },
         // { id_RX_CDR_FREQ_ACC_VAL, 15, 0 },
         // { id_RX_CDR_PHASE_ACC_VAL, 16, 0 },
@@ -379,6 +379,7 @@ void GateMatePacker::pack_serdes()
             ci.params[ctx->idf("RX_EN_EQA_EXT_VALUE_%d", i)] = Property((rx_en_eqa_ext_value >> i) & 1, 1);
         ci.unsetParam(id_RX_EN_EQA_EXT_VALUE);
     }
+    flush_cells();
 }
 
 NEXTPNR_NAMESPACE_END

@@ -530,6 +530,35 @@ struct NexusFasmWriter
         write_cell_muxes(cell);
         pop(2);
     }
+    // Write config for an CONFIG_MULTIBOOT_CORE cell
+    void write_multiboot(const CellInfo *cell)
+    {
+        BelId bel = cell->bel;
+        push_bel(bel);
+        write_enum(cell, "SOURCESEL", "DIS");
+        write_int_vector(stringf("MSPIADDR[31:0]"), ctx->parse_lattice_param_from_cell(cell, id_MSPIADDR, 32, 0).intval,
+                         32);
+        pop();
+    }
+    // Write config for an CONFIG_LMMI_CORE cell
+    void write_lmmi(const CellInfo *cell)
+    {
+        BelId bel = cell->bel;
+        push_bel(bel);
+        write_enum(cell, "LMMI_EN", "DIS");
+        pop();
+    }
+    // Write config for an CONFIG_CLKRST_CORE cell
+    void write_cfg_clkrst(const CellInfo *cell)
+    {
+        BelId bel = cell->bel;
+        push_bel(bel);
+        write_enum(cell, "MCJTAGGSRNDIS", "EN");
+        write_enum(cell, "MCLMMIGSRNDIS", "EN");
+        write_enum(cell, "MCSEDCGSRNDIS", "EN");
+        write_enum(cell, "MCWDTGSRNDIS", "EN");
+        pop();
+    }
     // Write config for DCC
     void write_dcc(const CellInfo *cell)
     {
@@ -631,6 +660,18 @@ struct NexusFasmWriter
         write_enum(cell, "IDDRX1_ODDRX1.TRISTATE");
         write_enum(cell, "GSR", "DISABLED");
         write_enum(cell, "TSREG.REGSET", "RESET");
+        if (cell->params.count(ctx->id("DELAY.DEL_VALUE"))) {
+            write_int_vector(stringf("DELAY.DEL_VALUE[6:0]"),
+                             int_or_default(cell->params, ctx->id("DELAY.DEL_VALUE"), 0), 7);
+        }
+        write_enum(cell, "DELAY.COARSE_DELAY");
+        write_enum(cell, "DELAY.COARSE_DELAY_MODE");
+        write_enum(cell, "DELAY.EDGE_MONITOR");
+        write_enum(cell, "DELAY.WAIT_FOR_EDGE");
+        write_enum(cell, "DELAYMUX");
+        write_enum(cell, "INMUX");
+        write_enum(cell, "OUTMUX");
+
         write_cell_muxes(cell);
         pop();
     }
@@ -1095,6 +1136,12 @@ struct NexusFasmWriter
                 write_dcc(ci);
             else if (ci->type == id_DCS)
                 write_dcs(ci);
+            else if (ci->type == id_CONFIG_MULTIBOOT_CORE)
+                write_multiboot(ci);
+            else if (ci->type == id_CONFIG_LMMI_CORE)
+                write_lmmi(ci);
+            else if (ci->type == id_CONFIG_CLKRST_CORE)
+                write_cfg_clkrst(ci);
             blank();
         }
         // Handle DCC route-throughs

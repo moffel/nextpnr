@@ -34,13 +34,14 @@
 #include <deque>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <set>
 
 #include "log.h"
 #include "nextpnr.h"
+#include "nextpnr_assertions.h"
 #include "router1.h"
-#include "scope_lock.h"
 #include "timing.h"
 #include "util.h"
 
@@ -49,12 +50,18 @@ NEXTPNR_NAMESPACE_BEGIN
 namespace {
 struct Router2
 {
+    // std::pair<int, int> is a bit too confusing, so:
+    struct NetResourceData
+    {
+        int value = 0;
+        int count = 0;
+    };
 
     struct PerArcData
     {
         WireId sink_wire;
         BoundingBox bb;
-        bool routed = false;
+        bool routed = false, pre_routed = false;
     };
 
     // As we allow overlap at first; the nextpnr bind functions can't be used
@@ -64,6 +71,7 @@ struct Router2
         WireId src_wire;
         dict<WireId, std::pair<PipId, int>> wires;
         std::vector<std::vector<PerArcData>> arcs;
+        dict<GroupId, NetResourceData> resources;
         BoundingBox bb;
         // Coordinates of the center of the net, used for the weight-to-average
         int cx, cy, hpwl;
@@ -97,6 +105,14 @@ struct Router2
         PipId pip_fwd, pip_bwd;
         bool visited_fwd = false, visited_bwd = false;
         float cost_fwd = 0.0, cost_bwd = 0.0;
+    };
+
+    struct PerResourceData
+    {
+        GroupId key;
+        // Historical congestion cost
+        dict<int, int> value_count;
+        float hist_cong_cost = 1.0;
     };
 
     Context *ctx;
@@ -237,6 +253,36 @@ struct Router2
         }
     }
 
+    dict<GroupId, int> resource_to_idx;
+    dict<WireId, int> wire_to_resource;
+    std::vector<PerResourceData> flat_resources;
+
+    PerResourceData &resource_data(GroupId r) { return flat_resources[resource_to_idx.at(r)]; }
+
+    void setup_resources()
+    {
+        for (auto resource_key : ctx->getGroups()) {
+            if (!ctx->isGroupResource(resource_key))
+                continue;
+
+            auto entry = resource_to_idx.find(resource_key);
+
+            if (entry == resource_to_idx.end()) {
+                auto data = PerResourceData{};
+                data.key = resource_key;
+                resource_to_idx.insert({resource_key, flat_resources.size()});
+                flat_resources.push_back(data);
+
+                entry = resource_to_idx.find(resource_key);
+            }
+            for (auto pip : ctx->getGroupPips(resource_key)) {
+                auto dest_wire = ctx->getPipDstWire(pip);
+                if (wire_to_resource.count(dest_wire) == 0)
+                    wire_to_resource.insert({dest_wire, entry->second});
+            }
+        }
+    }
+
     struct QueuedWire
     {
 
@@ -316,8 +362,8 @@ struct Router2
     void bind_pip_internal(PerNetData &net, store_index<PortRef> user, int wire, PipId pip)
     {
         auto &wd = flat_wires.at(wire);
-        auto found = net.wires.find(wd.w);
-        if (found == net.wires.end()) {
+        auto wire_found = net.wires.find(wd.w);
+        if (wire_found == net.wires.end()) {
             // Not yet used for any arcs of this net, add to list
             net.wires.emplace(wd.w, std::make_pair(pip, 1));
             // Increase bound count of wire by 1
@@ -325,21 +371,71 @@ struct Router2
         } else {
             // Already used for at least one other arc of this net
             // Don't allow two uphill PIPs for the same net and wire
-            NPNR_ASSERT(found->second.first == pip);
+            NPNR_ASSERT(wire_found->second.first == pip);
             // Increase the count of bound arcs
-            ++found->second.second;
+            ++wire_found->second.second;
+        }
+
+        if (pip == PipId())
+            return;
+
+        auto resource_key = ctx->getResourceKeyForPip(pip);
+        if (resource_key == GroupId())
+            return;
+
+        auto &rd = resource_data(resource_key);
+        auto resource_value = ctx->getResourceValueForPip(pip);
+
+        auto resource_found = net.resources.find(resource_key);
+
+        if (resource_found == net.resources.end()) {
+            net.resources.emplace(resource_key, NetResourceData{resource_value, 1});
+        } else {
+            // net resource value must agree with arc resource value
+            NPNR_ASSERT(resource_found->second.value == resource_value);
+
+            ++resource_found->second.count;
+        }
+
+        auto resource_value_count = rd.value_count.find(resource_value);
+        if (resource_value_count == rd.value_count.end()) {
+            rd.value_count.insert({resource_value, 1});
+        } else {
+            ++resource_value_count->second;
         }
     }
 
     void unbind_pip_internal(PerNetData &net, store_index<PortRef> user, WireId wire)
     {
         auto &wd = wire_data(wire);
-        auto &b = net.wires.at(wd.w);
-        --b.second;
-        if (b.second == 0) {
+        auto &wire_found = net.wires.at(wd.w);
+        auto pip = wire_found.first;
+
+        --wire_found.second;
+        if (wire_found.second == 0) {
             // No remaining arcs of this net bound to this wire
             --wd.curr_cong;
             net.wires.erase(wd.w);
+        }
+
+        if (pip == PipId())
+            return;
+
+        auto resource_key = ctx->getResourceKeyForPip(pip);
+        if (resource_key == GroupId())
+            return;
+
+        auto &rd = resource_data(resource_key);
+        auto resource_value = ctx->getResourceValueForPip(pip);
+        auto resource_found = net.resources.at(resource_key);
+
+        --resource_found.count;
+        --rd.value_count.at(resource_value);
+        if (resource_found.count == 0) {
+            net.resources.erase(resource_key);
+        }
+        if (rd.value_count.at(resource_value) == 0) {
+            rd.value_count.erase(resource_value);
         }
     }
 
@@ -358,6 +454,9 @@ struct Router2
             cursor = ctx->getPipSrcWire(pip);
         }
         ad.routed = false;
+        // Once we've ripped up the arc, the routing may no longer be the same as before...
+        // (this should only happen if it was not strongly bound)
+        ad.pre_routed = false;
     }
 
     float score_wire_for_arc(NetInfo *net, store_index<PortRef> user, size_t phys_pin, WireId wire, PipId pip,
@@ -369,6 +468,8 @@ struct Router2
         int overuse = wd.curr_cong;
         float hist_cost = 1.0f + crit_weight * (wd.hist_cong_cost - 1.0f);
         float bias_cost = 0;
+        float resource_hist_cost = 0.0f;
+        float resource_present_cost = 0.0f;
         int source_uses = 0;
         if (nd.wires.count(wire)) {
             overuse -= 1;
@@ -380,7 +481,16 @@ struct Router2
             bias_cost = cfg.bias_cost_factor * (base_cost / int(net->users.entries())) *
                         ((std::abs(pl.x - nd.cx) + std::abs(pl.y - nd.cy)) / float(nd.hpwl));
         }
-        return base_cost * hist_cost * present_cost / (1 + (source_uses * crit_weight)) + bias_cost;
+
+        auto resource_key = wire_to_resource.find(wire);
+        if (resource_key != wire_to_resource.end()) {
+            auto &rd = flat_resources.at(resource_key->second);
+            resource_hist_cost = 1.0f + crit_weight * (rd.hist_cong_cost - 1.0f);
+            resource_present_cost = 1.0f + rd.value_count.size() * curr_cong_weight * crit_weight;
+        }
+
+        return base_cost * hist_cost * present_cost / (1 + (source_uses * crit_weight)) + bias_cost +
+               base_cost * resource_hist_cost * resource_present_cost / (1 + crit_weight);
     }
 
     float get_togo_cost(NetInfo *net, store_index<PortRef> user, int wire, WireId src_sink, bool bwd, float crit_weight)
@@ -409,9 +519,16 @@ struct Router2
             auto &uh = nd.wires.at(cursor).first;
             if (uh == PipId())
                 break;
+            auto resource_key = ctx->getResourceKeyForPip(uh);
+            if (resource_key != GroupId()) {
+                auto &rd = resource_data(resource_key);
+                if (rd.value_count.size() > 1)
+                    break;
+            }
             cursor = ctx->getPipSrcWire(uh);
         }
-        return (cursor == src_wire);
+        return (cursor == src_wire) ||
+               (net->constant_value != IdString() && ctx->getWireConstantValue(cursor) == net->constant_value);
     }
 
     void record_prerouted_net(NetInfo *net, store_index<PortRef> usr, size_t phys_pin)
@@ -419,6 +536,7 @@ struct Router2
         auto &nd = nets.at(net->udata);
         auto &ad = nd.arcs.at(usr.idx()).at(phys_pin);
         ad.routed = true;
+        ad.pre_routed = true;
 
         WireId src = nets.at(net->udata).src_wire;
         WireId cursor = ad.sink_wire;
@@ -703,6 +821,7 @@ struct Router2
 
         // This records the point where forwards and backwards routing met
         int midpoint_wire = -1;
+        float best_midpoint_cost = 0;
         int explored = 1;
 
         for (; mode < 2; mode++) {
@@ -772,7 +891,7 @@ struct Router2
             // Mode 0 required both queues to be live
             while (((mode == 0) ? (!t.fwd_queue.empty() && !t.bwd_queue.empty())
                                 : (!t.fwd_queue.empty() || !t.bwd_queue.empty())) &&
-                   (!is_bb || iter < toexplore)) {
+                   ((!is_bb && midpoint_wire == -1) || iter < toexplore)) {
                 ++iter;
                 if (!t.fwd_queue.empty() && !const_mode) {
                     // Explore forwards
@@ -812,6 +931,14 @@ struct Router2
                         auto fnd_wire = nd.wires.find(next);
                         if (fnd_wire != nd.wires.end() && fnd_wire->second.first != dh)
                             continue;
+                        // Don't allow the same resource to be bound to the same net with a different value
+                        auto resource_key = ctx->getResourceKeyForPip(dh);
+                        if (resource_key != GroupId()) {
+                            auto fnd_resource = nd.resources.find(resource_key);
+                            if (fnd_resource != nd.resources.end() &&
+                                fnd_resource->second.value != ctx->getResourceValueForPip(dh))
+                                continue;
+                        }
                         if (!thread_test_wire(t, nwd))
                             continue; // thread safety issue
                         set_visited_fwd(t, next_idx, dh, next_score.delay);
@@ -824,11 +951,26 @@ struct Router2
                     t.bwd_queue.pop();
                     ++explored;
                     auto &curr_data = flat_wires.at(curr.wire);
-                    if (was_visited_fwd(curr.wire, std::numeric_limits<float>::max()) ||
-                        (const_mode && ctx->getWireConstantValue(curr_data.w) == net->constant_value)) {
-                        // Meet in the middle; done
-                        midpoint_wire = curr.wire;
-                        break;
+                    if (const_mode && ctx->getWireConstantValue(curr_data.w) == net->constant_value) {
+                        if (midpoint_wire == -1) {
+                            midpoint_wire = curr.wire;
+                            best_midpoint_cost = curr.score.cost;
+                            if (curr_cong_weight >= 10) {
+                                // try harder at this point to prevent infinite iterations when constants conflict
+                                toexplore = iter + std::min(200, int(curr.score.cost));
+                            } else {
+                                break;
+                            }
+                        } else if (curr.score.cost < best_midpoint_cost) {
+                            midpoint_wire = curr.wire;
+                            best_midpoint_cost = curr.score.cost;
+                        }
+                    } else {
+                        if (was_visited_fwd(curr.wire, std::numeric_limits<float>::max())) {
+                            // Meet in the middle; done
+                            midpoint_wire = curr.wire;
+                            break;
+                        }
                     }
                     // Don't allow the same wire to be bound to the same net with a different driving pip
                     PipId bound_pip;
@@ -862,6 +1004,14 @@ struct Router2
                         // Reserved for another net
                         if (nwd.reserved_net != -1 && nwd.reserved_net != net->udata)
                             continue;
+                        // Don't allow the same resource to be bound to the same net with a different value
+                        auto resource_key = ctx->getResourceKeyForPip(uh);
+                        if (resource_key != GroupId()) {
+                            auto fnd_resource = nd.resources.find(resource_key);
+                            if (fnd_resource != nd.resources.end() &&
+                                fnd_resource->second.value != ctx->getResourceValueForPip(uh))
+                                continue;
+                        }
                         if (!thread_test_wire(t, nwd))
                             continue; // thread safety issue
                         set_visited_bwd(t, next_idx, uh, next_score.delay);
@@ -892,8 +1042,15 @@ struct Router2
                     if (pip == PipId()) {
                         break;
                     }
-                    ROUTE_LOG_DBG("         fwd pip: %s (%d, %d)\n", ctx->nameOfPip(pip), ctx->getPipLocation(pip).x,
-                                  ctx->getPipLocation(pip).y);
+                    auto resource_key = ctx->getResourceKeyForPip(pip);
+                    if (resource_key != GroupId()) {
+                        ROUTE_LOG_DBG("         fwd pip: %s (%d, %d) %s = %d\n", ctx->nameOfPip(pip),
+                                      ctx->getPipLocation(pip).x, ctx->getPipLocation(pip).y,
+                                      ctx->nameOfGroup(resource_key), ctx->getResourceValueForPip(pip));
+                    } else {
+                        ROUTE_LOG_DBG("         fwd pip: %s (%d, %d)\n", ctx->nameOfPip(pip),
+                                      ctx->getPipLocation(pip).x, ctx->getPipLocation(pip).y);
+                    }
                     cursor_bwd = wire_to_idx.at(ctx->getPipSrcWire(pip));
                 }
 
@@ -924,8 +1081,16 @@ struct Router2
                 if (pip == PipId()) {
                     break;
                 }
-                ROUTE_LOG_DBG("         bwd pip: %s (%d, %d)\n", ctx->nameOfPip(pip), ctx->getPipLocation(pip).x,
-                              ctx->getPipLocation(pip).y);
+                auto resource_key = ctx->getResourceKeyForPip(pip);
+                if (resource_key != GroupId()) {
+                    ROUTE_LOG_DBG("         bwd pip: %s (%d, %d) %s = %d\n", ctx->nameOfPip(pip),
+                                  ctx->getPipLocation(pip).x, ctx->getPipLocation(pip).y,
+                                  ctx->nameOfGroup(resource_key), ctx->getResourceValueForPip(pip));
+                } else {
+                    ROUTE_LOG_DBG("         bwd pip: %s (%d, %d)\n", ctx->nameOfPip(pip), ctx->getPipLocation(pip).x,
+                                  ctx->getPipLocation(pip).y);
+                }
+
                 cursor_fwd = wire_to_idx.at(ctx->getPipDstWire(pip));
                 bind_pip_internal(nd, i, cursor_fwd, pip);
                 if (ctx->debug && !is_mt) {
@@ -1040,31 +1205,54 @@ struct Router2
 
     int total_wire_use = 0;
     int overused_wires = 0;
-    int total_overuse = 0;
+    int total_wire_overuse = 0;
+    int total_resource_use = 0;
+    int overused_resources = 0;
+    int total_resource_overuse = 0;
     std::vector<int> route_queue;
     std::set<int> failed_nets;
 
     void update_congestion()
     {
-        total_overuse = 0;
+        total_wire_overuse = 0;
         overused_wires = 0;
         total_wire_use = 0;
+        total_resource_overuse = 0;
+        overused_resources = 0;
+        total_resource_use = 0;
         failed_nets.clear();
-        pool<WireId> already_updated;
+        pool<WireId> already_updated_wires;
+        pool<GroupId> already_updated_resources;
         for (size_t i = 0; i < nets.size(); i++) {
             auto &nd = nets.at(i);
             for (const auto &w : nd.wires) {
                 ++total_wire_use;
                 auto &wd = wire_data(w.first);
                 if (wd.curr_cong > 1) {
-                    if (already_updated.count(w.first)) {
-                        ++total_overuse;
+                    if (already_updated_wires.count(w.first)) {
+                        ++total_wire_overuse;
                     } else {
                         if (curr_cong_weight > 0)
                             wd.hist_cong_cost =
                                     std::min(1e9, wd.hist_cong_cost + (wd.curr_cong - 1) * hist_cong_weight);
-                        already_updated.insert(w.first);
+                        already_updated_wires.insert(w.first);
                         ++overused_wires;
+                    }
+                    failed_nets.insert(i);
+                }
+            }
+            for (const auto &r : nd.resources) {
+                ++total_resource_use;
+                auto &rd = resource_data(r.first);
+                if (rd.value_count.size() > 1) {
+                    if (already_updated_resources.count(r.first)) {
+                        ++total_resource_overuse;
+                    } else {
+                        if (curr_cong_weight > 0)
+                            rd.hist_cong_cost =
+                                    std::min(1e9, rd.hist_cong_cost + (rd.value_count.size() - 1) * hist_cong_weight);
+                        already_updated_resources.insert(r.first);
+                        ++overused_resources;
                     }
                     failed_nets.insert(i);
                 }
@@ -1141,7 +1329,8 @@ struct Router2
                 if (bound_net == nullptr) {
                     to_bind.push_back(p);
                 }
-            } else {
+            } else if (!ad.pre_routed ||
+                       ctx->getBoundPipNet(p) != net) { // allow pre routing to break normal validity checking rules
                 if (ctx->verbose) {
                     log_info("Failed to bind pip %s to net %s\n", ctx->nameOfPip(p), net->name.c_str(ctx));
                 }
@@ -1266,6 +1455,22 @@ struct Router2
                 out << y << ",";
             out << std::endl;
         }
+    }
+
+    void write_congestion_by_net_heatmap(std::ostream &out)
+    {
+        dict<IdString, int> congestion_by_net;
+        for (size_t i = 0; i < nets_by_udata.size(); i++) {
+            IdString name = nets_by_udata.at(i)->name;
+            for (const auto &wire : nets.at(i).wires) {
+                const auto &wd = flat_wires.at(wire_to_idx.at(wire.first));
+                if (wd.curr_cong > 1)
+                    congestion_by_net[name] += (wd.curr_cong - 1);
+            }
+        }
+        // Write csv
+        for (auto &u : congestion_by_net)
+            out << u.first.c_str(ctx) << "," << u.second << std::endl;
     }
 
     int mid_x = 0, mid_y = 0;
@@ -1482,6 +1687,7 @@ struct Router2
         log_info("Running router2...\n");
         log_info("Setting up routing resources...\n");
         auto rstart = std::chrono::high_resolution_clock::now();
+        setup_resources();
         setup_nets();
         setup_wires();
         find_all_reserved_wires();
@@ -1491,7 +1697,7 @@ struct Router2
         ThreadContext st;
         int iter = 1;
 
-        ScopeLock<Context> lock(ctx);
+        std::unique_lock<Context> lock{*ctx};
 
         for (size_t i = 0; i < nets_by_udata.size(); i++)
             route_queue.push_back(i);
@@ -1529,28 +1735,27 @@ struct Router2
             if (!cfg.heatmap.empty()) {
                 {
                     std::string filename(cfg.heatmap + "_congestion_by_wiretype_" + std::to_string(iter) + ".csv");
-                    std::ofstream cong_map(filename);
-                    if (!cong_map)
-                        log_error("Failed to open congestion-by-wiretype heatmap %s for writing.\n", filename.c_str());
+                    auto cong_map = open_ofstream_and_log_error(filename, "congestion-by-wiretype heatmap");
                     write_congestion_by_wiretype_heatmap(cong_map);
                     log_info("        wrote congestion-by-wiretype heatmap to %s.\n", filename.c_str());
                 }
                 {
                     std::string filename(cfg.heatmap + "_utilisation_by_wiretype_" + std::to_string(iter) + ".csv");
-                    std::ofstream cong_map(filename);
-                    if (!cong_map)
-                        log_error("Failed to open utilisation-by-wiretype heatmap %s for writing.\n", filename.c_str());
+                    auto cong_map = open_ofstream_and_log_error(filename, "utilisation-by-wiretype heatmap");
                     write_utilisation_by_wiretype_heatmap(cong_map);
                     log_info("        wrote utilisation-by-wiretype heatmap to %s.\n", filename.c_str());
                 }
                 {
                     std::string filename(cfg.heatmap + "_congestion_by_coordinate_" + std::to_string(iter) + ".csv");
-                    std::ofstream cong_map(filename);
-                    if (!cong_map)
-                        log_error("Failed to open congestion-by-coordinate heatmap %s for writing.\n",
-                                  filename.c_str());
+                    auto cong_map = open_ofstream_and_log_error(filename, "congestion-by-coordinate heatmap");
                     write_congestion_by_coordinate_heatmap(cong_map);
                     log_info("        wrote congestion-by-coordinate heatmap to %s.\n", filename.c_str());
+                }
+                {
+                    std::string filename(cfg.heatmap + "_congestion_by_net_" + std::to_string(iter) + ".csv");
+                    auto cong_map = open_ofstream_and_log_error(filename, "congestion-by-net heatmap");
+                    write_congestion_by_net_heatmap(cong_map);
+                    log_info("        wrote congestion-by-net heatmap to %s.\n", filename.c_str());
                 }
             }
             int tmgfail = 0;
@@ -1567,19 +1772,24 @@ struct Router2
                     }
                 }
             }
-            if (overused_wires == 0 && tmgfail == 0) {
+            if (overused_wires == 0 && overused_resources == 0 && tmgfail == 0) {
                 // Try and actually bind nextpnr Arch API wires
                 bind_and_check_all();
             }
             for (auto cn : failed_nets)
                 route_queue.push_back(cn);
+            std::string resource_str = total_resource_use == 0
+                                               ? ""
+                                               : stringf("resources=%d overused=%d overuse=%d ", total_resource_use,
+                                                         overused_resources, total_resource_overuse);
             if (timing_driven_ripup)
-                log_info("    iter=%d wires=%d overused=%d overuse=%d tmgfail=%d archfail=%s\n", iter, total_wire_use,
-                         overused_wires, total_overuse, tmgfail,
+                log_info("    iter=%d wires=%d overused=%d overuse=%d %stmgfail=%d "
+                         "archfail=%s\n",
+                         iter, total_wire_use, overused_wires, total_wire_overuse, resource_str.c_str(), tmgfail,
                          (overused_wires > 0 || tmgfail > 0) ? "NA" : std::to_string(arch_fail).c_str());
             else
-                log_info("    iter=%d wires=%d overused=%d overuse=%d archfail=%s\n", iter, total_wire_use,
-                         overused_wires, total_overuse,
+                log_info("    iter=%d wires=%d overused=%d overuse=%d %sarchfail=%s\n", iter, total_wire_use,
+                         overused_wires, total_wire_overuse, resource_str.c_str(),
                          (overused_wires > 0 || tmgfail > 0) ? "NA" : std::to_string(arch_fail).c_str());
             ++iter;
             if (curr_cong_weight < 1e9)
@@ -1603,7 +1813,7 @@ struct Router2
 
         log_info("Running router1 to check that route is legal...\n");
 
-        lock.unlock_early();
+        lock.unlock();
 
         router1(ctx, Router1Cfg(ctx));
     }

@@ -75,20 +75,57 @@ else()
     set(BBASM_MODE "string")
 endif()
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(CheckCXXSourceCompiles)
+
+    check_cxx_source_compiles("
+        #include <gnu/libc-version.h>
+        int main() { return 0; }
+    " HAVE_GLIBC)
+
+    if (HAVE_GLIBC)
+        set(USE_LIBUNWIND OFF)
+    else()
+        set(USE_LIBUNWIND ON)
+        find_library(LIBUNWIND_LIBRARY NAMES unwind)
+        find_path(LIBUNWIND_INCLUDE_DIR NAMES libunwind.h)
+
+        if(LIBUNWIND_LIBRARY)
+            find_library(LIBUNWIND_LIBRARY_ARCH NAMES "unwind-${CMAKE_SYSTEM_PROCESSOR}")
+            if(LIBUNWIND_LIBRARY_ARCH)
+                set(LIBUNWIND_LIBRARY "${LIBUNWIND_LIBRARY};${LIBUNWIND_LIBRARY_ARCH}")
+            endif()
+        endif()
+
+        if(NOT LIBUNWIND_LIBRARY OR NOT LIBUNWIND_INCLUDE_DIR)
+            message(FATAL_ERROR "libunwind not found. Install libunwind-dev")
+        endif()
+    endif()
+else()
+    set(USE_LIBUNWIND OFF)
+endif()
+
 find_package(Threads)
-if (NOT Threads_FOUND)
+if (CMAKE_SYSTEM_NAME STREQUAL "WASI")
+    include(CheckCXXSourceCompiles)
+
+    # On WASI, pthreads are always available but pthread_create() always fails
+    # unless the pthread-enabled triple that defines `_REENTRANT` is used.
+    check_cxx_source_compiles([[
+    #if !defined(_REENTRANT)
+    #  error "No threads"
+    #endif
+    int main(void) { return 0; }
+    ]] HAVE_REENTRANT)
+    if (NOT HAVE_REENTRANT)
+        add_definitions(-DNPNR_DISABLE_THREADS)
+    endif()
+elseif (NOT Threads_FOUND)
     add_definitions(-DNPNR_DISABLE_THREADS)
 endif()
 
-if (WASI)
+if (CMAKE_SYSTEM_NAME STREQUAL "WASI")
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lwasi-emulated-mman")
-    add_definitions(
-        -DBOOST_EXCEPTION_DISABLE
-        -DBOOST_NO_EXCEPTIONS
-    )
-    if (NOT Threads_FOUND)
-        add_definitions(-DBOOST_NO_CXX11_HDR_MUTEX)
-    endif()
 endif()
 
 if (STATIC_BUILD)
@@ -360,7 +397,7 @@ function(add_nextpnr_architecture target)
     add_executable(nextpnr-${target} ${arg_MAIN_SOURCE})
     set_property(TARGET nextpnr-${target} PROPERTY RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
     set_property(TARGET nextpnr-${target} PROPERTY OUTPUT_NAME ${PROGRAM_PREFIX}nextpnr-${target})
-    if (WASI)
+    if (CMAKE_SYSTEM_NAME STREQUAL "WASI")
         # set(CMAKE_EXECUTABLE_SUFFIX) breaks CMake tests for some reason
         set_property(TARGET nextpnr-${target} PROPERTY SUFFIX ".wasm")
     endif()
@@ -368,6 +405,10 @@ function(add_nextpnr_architecture target)
     target_link_libraries(nextpnr-${target} PRIVATE nextpnr-${target}-core)
     if (BUILD_GUI)
         target_link_libraries(nextpnr-${target} PRIVATE nextpnr-${target}-gui)
+        if (USE_LIBUNWIND)
+            target_include_directories(nextpnr-${target} PRIVATE ${LIBUNWIND_INCLUDE_DIR})
+            target_link_libraries(nextpnr-${target} PRIVATE ${LIBUNWIND_LIBRARY})
+        endif()
     endif()
 
     install(TARGETS nextpnr-${target} RUNTIME DESTINATION bin)
@@ -386,6 +427,10 @@ function(add_nextpnr_architecture target)
         if (BUILD_GUI)
             target_link_libraries(nextpnr-${target}-test PRIVATE nextpnr-${target}-gui)
             target_link_libraries(nextpnr-${target}-test PRIVATE nextpnr_test_gui)
+            if (USE_LIBUNWIND)
+                target_include_directories(nextpnr-${target}-test PRIVATE ${LIBUNWIND_INCLUDE_DIR})
+                target_link_libraries(nextpnr-${target}-test PRIVATE ${LIBUNWIND_LIBRARY})
+            endif()
         endif()
     endif()
 

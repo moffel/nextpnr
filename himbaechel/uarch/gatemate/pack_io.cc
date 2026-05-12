@@ -37,7 +37,7 @@ void GateMatePacker::pack_io()
     // Trim nextpnr IOBs - assume IO buffer insertion has been done in synthesis
     for (auto &port : ctx->ports) {
         if (!ctx->cells.count(port.first))
-            log_error("Port '%s' doesn't seem to have a corresponding top level IO\n", ctx->nameOf(port.first));
+            log_error("Port '%s' doesn't seem to have a corresponding top level IO.\n", ctx->nameOf(port.first));
         CellInfo *ci = ctx->cells.at(port.first).get();
 
         PortRef top_port;
@@ -51,7 +51,7 @@ void GateMatePacker::pack_io()
             if (o == nullptr)
                 ;
             else if (o->users.entries() > 1)
-                log_error("Top level pin '%s' has multiple input buffers\n", ctx->nameOf(port.first));
+                log_error("Top level pin '%s' has multiple input buffers.\n", ctx->nameOf(port.first));
             else if (o->users.entries() == 1)
                 top_port = *o->users.begin();
         }
@@ -61,15 +61,15 @@ void GateMatePacker::pack_io()
             NetInfo *i = ci->getPort(id_I);
             if (i != nullptr && i->driver.cell != nullptr) {
                 if (top_port.cell != nullptr)
-                    log_error("Top level pin '%s' has multiple input/output buffers\n", ctx->nameOf(port.first));
+                    log_error("Top level pin '%s' has multiple input/output buffers.\n", ctx->nameOf(port.first));
                 top_port = i->driver;
             }
             // Edge case of a bidirectional buffer driving an output pin
             if (i->users.entries() > 2) {
-                log_error("Top level pin '%s' has illegal buffer configuration\n", ctx->nameOf(port.first));
+                log_error("Top level pin '%s' has illegal buffer configuration.\n", ctx->nameOf(port.first));
             } else if (i->users.entries() == 2) {
                 if (top_port.cell != nullptr)
-                    log_error("Top level pin '%s' has illegal buffer configuration\n", ctx->nameOf(port.first));
+                    log_error("Top level pin '%s' has illegal buffer configuration.\n", ctx->nameOf(port.first));
                 for (auto &usr : i->users) {
                     if (usr.cell->type == ctx->id("$nextpnr_obuf") || usr.cell->type == ctx->id("$nextpnr_iobuf"))
                         continue;
@@ -79,7 +79,7 @@ void GateMatePacker::pack_io()
             }
         }
         if (!is_npnr_iob)
-            log_error("Port '%s' doesn't seem to have a corresponding top level IO (internal cell type mismatch)\n",
+            log_error("Port '%s' doesn't seem to have a corresponding top level IO (internal cell type mismatch).\n",
                       ctx->nameOf(port.first));
 
         if (top_port.cell == nullptr) {
@@ -129,7 +129,7 @@ void GateMatePacker::pack_io()
         if (ci.params.count(id_LOC)) {
             std::string new_loc = str_or_default(ci.params, id_LOC, "UNPLACED");
             if (loc != "UNPLACED" && loc != new_loc)
-                log_warning("Overriding location of cell '%s' from '%s' with '%s'\n", ctx->nameOf(&ci), loc.c_str(),
+                log_warning("Overriding location of cell '%s' from '%s' with '%s'.\n", ctx->nameOf(&ci), loc.c_str(),
                             new_loc.c_str());
             loc = new_loc;
         }
@@ -177,8 +177,9 @@ void GateMatePacker::pack_io()
         for (auto &p : ci.params) {
 
             if (p.first.in(id_PIN_NAME, id_PIN_NAME_P, id_PIN_NAME_N)) {
-                if (ctx->get_package_pin_bel(ctx->id(p.second.as_string())) == BelId())
-                    log_error("Unknown %s '%s' for cell '%s'.\n", p.first.c_str(ctx), p.second.as_string().c_str(),
+                std::string pname = p.second.as_string();
+                if (pname != "UNPLACED" && ctx->get_package_pin_bel(ctx->id(pname)) == BelId())
+                    log_error("Unknown %s '%s' for cell '%s'.\n", p.first.c_str(ctx), pname.c_str(),
                               ci.name.c_str(ctx));
                 keys.push_back(p.first);
                 continue;
@@ -194,9 +195,15 @@ void GateMatePacker::pack_io()
                 continue;
             if (ci.type.in(id_CC_TOBUF) && p.first.in(id_PULLUP, id_PULLDOWN, id_KEEPER))
                 continue;
-            if (ci.type.in(id_CC_OBUF, id_CC_TOBUF, id_CC_IOBUF) &&
-                p.first.in(id_DRIVE, id_SLEW, id_DELAY_OBF, id_FF_OBF))
-                continue;
+            if (ci.type.in(id_CC_OBUF, id_CC_TOBUF, id_CC_IOBUF)) {
+                if (p.first.in(id_DRIVE, id_SLEW)) {
+                    if (p.second.is_string && p.second.as_string() == "UNDEFINED")
+                        keys.push_back(p.first);
+                    continue;
+                }
+                if (p.first.in(id_DELAY_OBF, id_FF_OBF))
+                    continue;
+            }
             if (ci.type.in(id_CC_LVDS_IBUF, id_CC_LVDS_IOBUF) && p.first.in(id_LVDS_RTERM, id_DELAY_IBF, id_FF_IBF))
                 continue;
             if (ci.type.in(id_CC_LVDS_OBUF, id_CC_LVDS_TOBUF, id_CC_LVDS_IOBUF) &&
@@ -322,12 +329,12 @@ void GateMatePacker::pack_io()
                 bel = ctx->get_package_pin_bel(ctx->id(loc));
         }
         if (bel == BelId())
-            log_error("Unable to constrain IO '%s', device does not have a pin named '%s'\n", ci.name.c_str(ctx),
+            log_error("Unable to constrain IO '%s', device does not have a pin named '%s'.\n", ci.name.c_str(ctx),
                       loc.c_str());
         log_info("    Constraining '%s' to pad '%s'%s.\n", ci.name.c_str(ctx), loc.c_str(),
                  get_die_name(uarch->dies, uarch->tile_extra_data(bel.tile)->die).c_str());
         if (!ctx->checkBelAvail(bel)) {
-            log_error("Can't place %s at %s because it's already taken by %s\n", ctx->nameOf(&ci), ctx->nameOfBel(bel),
+            log_error("Can't place %s at %s because it's already taken by %s.\n", ctx->nameOf(&ci), ctx->nameOfBel(bel),
                       ctx->nameOf(ctx->getBoundBelCell(bel)));
         }
 
@@ -533,11 +540,11 @@ void GateMatePacker::pack_io_sel()
                 if (do_net->driver.cell && do_net->driver.cell->type == id_CC_LUT1 && do_net->users.entries() == 1) {
                     NetInfo *net = do_net->driver.cell->getPort(id_I0);
                     if (net->driver.cell && net->driver.cell->type == id_CC_ODDR && net->users.entries() == 1) {
-                        do_net = net;
-                        packed_cells.insert(net->driver.cell->name);
+                        packed_cells.insert(do_net->driver.cell->name);
                         // Inverting both input is equal to inverter at output
                         is_inverted[0] = true;
                         is_inverted[1] = true;
+                        do_net = net;
                     }
                 }
                 if (do_net->driver.cell && do_net->driver.cell->type == id_CC_ODDR && do_net->users.entries() == 1) {
@@ -553,7 +560,7 @@ void GateMatePacker::pack_io_sel()
                     int die = uarch->tile_extra_data(ci.bel.tile)->die;
                     auto [cpe_half, cpe_ramio] = ddr[die][pad->pad_bank];
                     if (cpe_half) {
-                        if (cpe_half->getPort(id_IN1) != oddr->getPort(id_DDR))
+                        if (cpe_half->getPort(id_D0_10) != oddr->getPort(id_DDR))
                             log_error("DDR port use signal different than already occupied DDR source.\n");
                         ci.addInput(id_DDR);
                         ci.connectPort(id_DDR, cpe_ramio->getPort(id_RAM_O));
@@ -561,7 +568,7 @@ void GateMatePacker::pack_io_sel()
                         auto l = reinterpret_cast<const GateMatePadExtraDataPOD *>(pad->extra_data.get());
                         oddr->movePortTo(id_DDR, &ci, id_DDR);
                         ddr[die][pad->pad_bank] = move_ram_o(&ci, id_DDR, false, Loc(l->x, l->y, l->z));
-                        uarch->ddr_nets.insert(ddr[die][pad->pad_bank].first->getPort(id_IN1)->name);
+                        uarch->ddr_nets.insert(ddr[die][pad->pad_bank].first->getPort(id_D0_10)->name);
                     }
                     use_custom_clock = set_out_clk(oddr, &ci);
                     bool invert = bool_or_default(oddr->params, id_CLK_INV, 0);

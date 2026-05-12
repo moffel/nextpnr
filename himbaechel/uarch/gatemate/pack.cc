@@ -103,10 +103,10 @@ void GateMatePacker::copy_constraint(const NetInfo *in_net, NetInfo *out_net)
     if (!in_net || !out_net)
         return;
     if (ctx->debug)
-        log_info("copy clock period constraint on net '%s' from net '%s'\n", out_net->name.c_str(ctx),
+        log_info("Copy clock period constraint on net '%s' from net '%s'\n", out_net->name.c_str(ctx),
                  in_net->name.c_str(ctx));
     if (out_net->clkconstr.get() != nullptr)
-        log_warning("found multiple clock constraints on net '%s'\n", out_net->name.c_str(ctx));
+        log_warning("Found multiple clock constraints on net '%s'\n", out_net->name.c_str(ctx));
     if (in_net->clkconstr) {
         out_net->clkconstr = std::unique_ptr<ClockConstraint>(new ClockConstraint());
         out_net->clkconstr->low = in_net->clkconstr->low;
@@ -131,10 +131,83 @@ void GateMatePacker::count_cell(CellInfo &ci)
     count++;
 }
 
+inline int lut2_apply_constant_inputs(int init, int d0_const, int d1_const)
+{
+    int b0 = (init >> 0) & 1;
+    int b1 = (init >> 1) & 1;
+    int b2 = (init >> 2) & 1;
+    int b3 = (init >> 3) & 1;
+
+    int out[4];
+
+    for (int i = 0; i < 4; i++) {
+        int D1 = (i >> 1) & 1;
+        int D0 = (i >> 0) & 1;
+
+        // Apply constants if present
+        if (d0_const != -1)
+            D0 = d0_const;
+        if (d1_const != -1)
+            D1 = d1_const;
+
+        int src = (D1 << 1) | D0;
+        out[i] = (src == 0) ? b0 : (src == 1) ? b1 : (src == 2) ? b2 : b3;
+    }
+
+    return (out[3] << 3) | (out[2] << 2) | (out[1] << 1) | out[0];
+}
+
+void GateMatePacker::optimize_lut2(CellInfo &ci, IdString i0, IdString i1, IdString init)
+{
+    auto lut2_same_inputs = [&](int lut) -> int {
+        int b0 = lut & 1;        // bit 0
+        int b3 = (lut >> 3) & 1; // bit 3
+
+        return (b3 << 3) | (b3 << 2) | (b0 << 1) | b0;
+    };
+
+    uint8_t val = int_or_default(ci.params, init, 0);
+    int d0_const = -1;
+    int d1_const = -1;
+    if (ci.getPort(i0) && ci.getPort(i0) == net_PACKER_GND) {
+        d0_const = 0;
+        ci.disconnectPort(i0);
+    }
+    if (ci.getPort(i0) && ci.getPort(i0) == net_PACKER_VCC) {
+        d0_const = 1;
+        ci.disconnectPort(i0);
+    }
+    if (ci.getPort(i1) && ci.getPort(i1) == net_PACKER_GND) {
+        d1_const = 0;
+        ci.disconnectPort(i1);
+    }
+    if (ci.getPort(i1) && ci.getPort(i1) == net_PACKER_VCC) {
+        d1_const = 1;
+        ci.disconnectPort(i1);
+    }
+
+    val = lut2_apply_constant_inputs(val, d0_const, d1_const);
+
+    if (ci.getPort(i0) == ci.getPort(i1)) {
+        val = lut2_same_inputs(val);
+        ci.params[init] = Property(val, 4);
+        ci.disconnectPort(i1);
+    }
+}
+
 void GateMatePacker::optimize_lut()
 {
     for (auto &cell : ctx->cells) {
         CellInfo &ci = *cell.second;
+        if (ci.type == id_CC_LUT2) {
+            optimize_lut2(ci, id_I0, id_I1, id_INIT);
+        } else if (ci.type == id_CC_L2T4) {
+            optimize_lut2(ci, id_I0, id_I1, id_INIT_L00);
+            optimize_lut2(ci, id_I2, id_I3, id_INIT_L01);
+        } else if (ci.type == id_CC_L2T5) {
+            optimize_lut2(ci, id_I0, id_I1, id_INIT_L02);
+            optimize_lut2(ci, id_I2, id_I3, id_INIT_L03);
+        }
         if (!ci.type.in(id_CC_LUT1, id_CC_LUT2))
             continue;
         if (ci.attrs.count(ctx->id("keep")))
@@ -318,6 +391,13 @@ void GateMatePacker::repack_cpe()
             loc.z = CPE_LT_FULL_Z;
             ctx->unbindBel(bel);
             ctx->bindBel(ctx->getBelByLocation(loc), cell.second.get(), strength);
+            cell.second->renamePort(id_D0_00, id_D0_02);
+            cell.second->renamePort(id_D1_00, id_D1_02);
+            cell.second->renamePort(id_D0_01, id_D0_03);
+            cell.second->renamePort(id_D1_01, id_D1_03);
+            cell.second->renamePort(id_D0_10, id_D0_11);
+            cell.second->renamePort(id_D1_10, id_D1_11);
+
             cell.second->renamePort(id_IN1, id_IN5);
             cell.second->renamePort(id_IN2, id_IN6);
             cell.second->renamePort(id_IN3, id_IN7);
@@ -368,6 +448,14 @@ void GateMatePacker::repack_cpe()
                 cell.second->params[id_C_I1] = Property(int_or_default(upper->params, id_C_I1, 0), 1);
             if (upper->params.count(id_C_I2))
                 cell.second->params[id_C_I2] = Property(int_or_default(upper->params, id_C_I2, 0), 1);
+
+            upper->movePortTo(id_D0_00, cell.second.get(), id_D0_00);
+            upper->movePortTo(id_D1_00, cell.second.get(), id_D1_00);
+            upper->movePortTo(id_D0_01, cell.second.get(), id_D0_01);
+            upper->movePortTo(id_D1_01, cell.second.get(), id_D1_01);
+            upper->movePortTo(id_D0_10, cell.second.get(), id_D0_10);
+            upper->movePortTo(id_D1_10, cell.second.get(), id_D1_10);
+
             upper->movePortTo(id_IN1, cell.second.get(), id_IN1);
             upper->movePortTo(id_IN2, cell.second.get(), id_IN2);
             upper->movePortTo(id_IN3, cell.second.get(), id_IN3);
@@ -424,11 +512,42 @@ void GateMatePacker::assign_clocks()
     }
 }
 
+static IdString get_scopename(Context *ctx, CellInfo &ci)
+{
+    std::string scope = "top";
+    if (ci.attrs.count(ctx->id("scopename"))) {
+        scope = str_or_default(ci.attrs, ctx->id("scopename"), "");
+        scope = "top " + scope;
+    } else if (ci.attrs.count(ctx->id("hdlname"))) {
+        scope = str_or_default(ci.attrs, ctx->id("hdlname"), "");
+        scope = "top " + scope;
+    }
+    return IdString(ctx, scope.c_str());
+}
+
+void GateMatePacker::find_regions()
+{
+    for (auto &cell : ctx->cells) {
+        CellInfo &ci = *cell.second;
+        IdString name = get_scopename(ctx, ci);
+        uarch->scopenames.emplace(name);
+    }
+    if (uarch->scopenames.size() > 1) {
+        log_info("Detected regions..\n");
+        for (auto &scope : uarch->scopenames) {
+            log_info("    %s\n", scope.c_str(ctx));
+        }
+    }
+}
+
 void GateMatePacker::assign_regions()
 {
     log_info("Assign cell region based on attributes..\n");
     for (auto &cell : ctx->cells) {
         CellInfo &ci = *cell.second;
+        IdString name = get_scopename(ctx, ci);
+        if (uarch->scopenames_used.count(name))
+            ctx->constrainCellToRegion(ci.name, name);
         if (ci.attrs.count(id_GATEMATE_DIE) != 0) {
             std::string die_name = str_or_default(ci.attrs, id_GATEMATE_DIE, "");
             IdString die = ctx->id(die_name);
@@ -478,6 +597,8 @@ void GateMatePacker::fix_regions()
 void GateMateImpl::pack()
 {
     const ArchArgs &args = ctx->args;
+    GateMatePacker packer(ctx, this);
+    packer.find_regions();
     if (args.options.count("ccf")) {
         parse_ccf(args.options["ccf"].as<std::string>());
     }
@@ -486,15 +607,16 @@ void GateMateImpl::pack()
         std::string val = args.options["strategy"].as<std::string>();
         if (val == "mirror") {
             strategy = MultiDieStrategy::CLOCK_MIRROR;
-            log_info("Multidie mode: CLOCK MIRROR\n");
+            log_info("Multidie mode: CLOCK MIRROR.\n");
         } else if (val == "clk1") {
             strategy = MultiDieStrategy::REUSE_CLK1;
-            log_info("Multidie mode: REUSE CLK1\n");
+            log_info("Multidie mode: REUSE CLK1.\n");
         } else if (val == "full") {
             strategy = MultiDieStrategy::FULL_USE;
-            log_info("Multidie mode: FULL USE\n");
+            log_info("Multidie mode: FULL USE.\n");
         } else {
-            log_error("Unknown value for 'strategy' option. Allowed values are 'mirror', 'full' and 'clk1'.\n");
+            log_error("Unknown value='%s' for 'strategy' option. Allowed values are 'mirror', 'full' and 'clk1'.\n",
+                      val.c_str());
         }
     } else {
         strategy = MultiDieStrategy::CLOCK_MIRROR;
@@ -511,7 +633,6 @@ void GateMateImpl::pack()
     if (strategy == MultiDieStrategy::REUSE_CLK1 || strategy == MultiDieStrategy::FULL_USE)
         preferred_die = 0;
 
-    GateMatePacker packer(ctx, this);
     if (forced_die == IdString())
         packer.assign_regions();
     packer.pack_constants();

@@ -49,6 +49,7 @@ struct XilinxCellTags
             bool is_latch, is_clkinv, is_srinv, ffsync;
             bool is_paired;
             NetInfo *clk, *sr, *ce, *d;
+            int32_t control_set;
         } ff;
         struct
         {
@@ -137,6 +138,7 @@ struct XilinxImpl : HimbaechelAPI
     void write_fasm(const std::string &filename);
 
     void configurePlacerHeap(PlacerHeapCfg &cfg) override;
+    void configurePlacerStatic(PlacerStaticCfg &cfg) override;
 
     void fixup_placement();
     void fixup_routing();
@@ -149,6 +151,7 @@ struct XilinxImpl : HimbaechelAPI
     bool is_bram_tile(BelId bel) const;
 
     SiteIndex get_bel_site(BelId bel) const;
+    SiteIndex rel_site(SiteIndex site, int dx, int dy) const;
     Loc rel_site_loc(SiteIndex site) const;
     IdString get_site_name(SiteIndex site) const;
     IdString bel_name_in_site(BelId bel) const;
@@ -169,17 +172,21 @@ struct XilinxImpl : HimbaechelAPI
 
     std::vector<TileStatus> tile_status;
 
+    bool cell_tags_set = false;
+
     // Improved delay predictions where sites are located far from their associated interconnect
     dict<WireId, Loc> source_locs, sink_locs;
     bool is_general_routing(WireId wire) const;
     void find_source_sink_locs();
 
+    delay_t predictDelay(BelId src_bel, IdString src_pin, BelId dst_bel, IdString dst_pin) const override;
     delay_t estimateDelay(WireId src, WireId dst) const override;
     BoundingBox getRouteBoundingBox(WireId src, WireId dst) const override;
 
   private:
     HimbaechelHelpers h;
     void assign_cell_tags();
+    void index_control_sets();
 };
 
 NEXTPNR_NAMESPACE_END

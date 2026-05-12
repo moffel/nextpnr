@@ -10,11 +10,14 @@
 #define HIMBAECHEL_CONSTIDS "uarch/gowin/constids.inc"
 #include "himbaechel_constids.h"
 
+#include "array2d.h"
 #include "cst.h"
 #include "globals.h"
 #include "gowin.h"
 #include "gowin_utils.h"
 #include "pack.h"
+
+#include "placer_heap.h"
 
 NEXTPNR_NAMESPACE_BEGIN
 
@@ -36,6 +39,8 @@ struct GowinImpl : HimbaechelAPI
     bool isBelLocationValid(BelId bel, bool explain_invalid) const override;
     void notifyBelChange(BelId bel, CellInfo *cell) override;
 
+    delay_t estimateDelay(WireId src, WireId dst) const override;
+
     // Bel bucket functions
     IdString getBelBucketForCellType(IdString cell_type) const override;
 
@@ -43,11 +48,16 @@ struct GowinImpl : HimbaechelAPI
 
     // wires
     bool checkPipAvail(PipId pip) const override;
+    bool checkPipAvailForNet(PipId pip, const NetInfo *net) const override;
 
     // Cluster
     bool isClusterStrict(const CellInfo *cell) const override { return true; }
     bool getClusterPlacement(ClusterId cluster, BelId root_bel,
                              std::vector<std::pair<CellInfo *, BelId>> &placement) const override;
+
+    void configurePlacerHeap(PlacerHeapCfg &cfg) override;
+
+    void drawBel(std::vector<GraphicElement> &g, GraphicElement::style_t style, IdString bel_type, Loc loc) override;
 
   private:
     HimbaechelHelpers h;
@@ -68,6 +78,8 @@ struct GowinImpl : HimbaechelAPI
         // dsp info
         const NetInfo *dsp_asign = nullptr, *dsp_bsign = nullptr, *dsp_asel = nullptr, *dsp_bsel = nullptr,
                       *dsp_ce = nullptr, *dsp_clk = nullptr, *dsp_reset = nullptr;
+        const NetInfo *dsp_5a_clk0 = nullptr, *dsp_5a_clk1 = nullptr, *dsp_5a_ce0 = nullptr, *dsp_5a_ce1 = nullptr,
+                      *dsp_5a_reset0 = nullptr, *dsp_5a_reset1 = nullptr;
         bool dsp_soa_reg;
     };
     std::vector<GowinCellInfo> fast_cell_info;
@@ -84,13 +96,15 @@ struct GowinImpl : HimbaechelAPI
     // allocated to internal primitives as needed. It is assumed that most
     // primitives use the same signals for CE, CLK and especially RESET, so
     // these wires are few and need to be controlled.
-    struct dsp_net_counters
+    struct dsp_info
     {
-        dict<IdString, int> ce;
-        dict<IdString, int> clk;
-        dict<IdString, int> reset;
+        dict<IdString, int> ce;    // CE nets counter
+        dict<IdString, int> clk;   // CLK nets counter
+        dict<IdString, int> reset; // RESET nets counter
+        int mode9bit;              // 9 bit elements counter
+        int mode18bit;             // 18 bit elements counter
     };
-    dict<BelId, dsp_net_counters> dsp_net_cnt;
+    dict<BelId, dsp_info> dsp_info;
     dict<BelId, CellInfo *> dsp_bel2cell; // Remember the connection with cells
                                           // since this information is already lost during unbinding
     void adjust_dsp_pin_mapping(void);
@@ -98,11 +112,16 @@ struct GowinImpl : HimbaechelAPI
     // Place explicityl constrained or implicitly constrained (by IOLOGIC) CLKDIV and CLKDIV2 cells
     // to avoid routing conflicts and maximize utilization
     void place_constrained_hclk_cells();
+    void place_5a_hclks(void);
 
     // bel placement validation
     bool slice_valid(int x, int y, int z) const;
     bool dsp_valid(Loc l, IdString bel_type, bool explain_invalid) const;
     bool hclk_valid(BelId bel, IdString bel_type) const;
+
+    array2d<std::vector<CellInfo *>> fast_logic_cell;
+
+    delay_t delay_m, delay_c;
 };
 
 struct GowinArch : HimbaechelArch
@@ -143,7 +162,8 @@ void GowinImpl::init_database(Arch *arch)
             std::regex devicere = std::regex("GW5A(T|ST)?-LV(25|60|138)[A-Z]*.*");
             std::smatch match;
             if (std::regex_match(args.device, match, devicere)) {
-                family = stringf("GW5A%s-%sA", match[1].str().c_str(), match[2].str().c_str());
+                family = stringf("GW5A%s-%s%s", match[1].str().c_str(), match[2].str().c_str(),
+                                 match[2].str() == "25" ? "A" : "C");
             } else {
                 std::regex devicere = std::regex("GW1N([SZ]?)[A-Z]*-(LV|UV|UX)([0-9])(C?).*");
                 std::smatch match;
@@ -179,7 +199,7 @@ void GowinImpl::init(Context *ctx)
 
     gwu.init(ctx);
 
-    const ArchArgs &args = ctx->getArchArgs();
+    const ArchArgs &args = ctx->args;
 
     // package and speed class
     std::regex speedre = std::regex("(.*)(C[0-9]/I[0-9])$");
@@ -232,6 +252,17 @@ void GowinImpl::init(Context *ctx)
     if (args.options.count("disable_gp_clock_routing")) {
         ctx->settings[id_NO_GP_CLOCK_ROUTING] = Property(1);
     }
+
+    // configure delay estimates for A*
+    if (args.device.rfind("GW2A", 0) == 0 || args.device.rfind("GW5A", 0) == 0) {
+        delay_c = 300;
+        delay_m = 60;
+        ctx->ripup_penalty = 400;
+    } else {
+        delay_c = 600;
+        delay_m = 120;
+        ctx->ripup_penalty = 800;
+    }
 }
 
 // We do not allow the use of global wires that bypass a special router.
@@ -241,14 +272,18 @@ bool GowinImpl::checkPipAvail(PipId pip) const
            (!(gwu.is_global_pip(pip) || gwu.is_segment_pip(pip)));
 }
 
+bool GowinImpl::checkPipAvailForNet(PipId pip, const NetInfo *net) const
+{
+    return (net->constant_value == IdString() && ctx->getWireConstantValue(ctx->getPipSrcWire(pip)) != IdString()) ||
+           (!(gwu.is_global_pip(pip) || gwu.is_segment_pip(pip)));
+}
+
 void GowinImpl::pack()
 {
     if (ctx->settings.count(ctx->id("cst.filename"))) {
         std::string filename = ctx->settings[ctx->id("cst.filename")].as_string();
-        std::ifstream in(filename);
-        if (!in) {
-            log_error("failed to open CST file '%s'\n", filename.c_str());
-        }
+        auto in = open_ifstream_and_log_error(filename, "CST file");
+
         if (!gowin_apply_constraints(ctx, in)) {
             log_error("failed to parse CST file '%s'\n", filename.c_str());
         }
@@ -266,6 +301,9 @@ void GowinImpl::pack()
 // We also indicate to the router which Bel's pin to use.
 void GowinImpl::adjust_dsp_pin_mapping(void)
 {
+    if (gwu.has_5A_DSP()) {
+        return;
+    }
     for (auto b2c : dsp_bel2cell) {
         BelId bel = b2c.first;
         Loc loc = ctx->getBelLocation(bel);
@@ -293,19 +331,275 @@ void GowinImpl::adjust_dsp_pin_mapping(void)
 
         if (dsp_data.dsp_reset != nullptr) {
             BelId dsp = ctx->getBelByLocation(Loc(loc.x, loc.y, BelZ::DSP_Z));
-            set_cell_bel_pin(dsp_net_cnt.at(dsp).reset, id_RESET, dsp_data.dsp_reset->name, "RESET%d",
+            set_cell_bel_pin(dsp_info.at(dsp).reset, id_RESET, dsp_data.dsp_reset->name, "RESET%d",
                              ci->type == id_MULT36X36 ? "RESET%d%d" : nullptr);
         }
         if (dsp_data.dsp_ce != nullptr) {
             BelId dsp = ctx->getBelByLocation(Loc(loc.x, loc.y, gwu.get_dsp_macro(loc.z)));
-            set_cell_bel_pin(dsp_net_cnt.at(dsp).ce, id_CE, dsp_data.dsp_ce->name, "CE%d",
+            set_cell_bel_pin(dsp_info.at(dsp).ce, id_CE, dsp_data.dsp_ce->name, "CE%d",
                              ci->type == id_MULT36X36 ? "CE%d%d" : nullptr);
         }
         if (dsp_data.dsp_clk != nullptr) {
             BelId dsp = ctx->getBelByLocation(Loc(loc.x, loc.y, gwu.get_dsp_macro(loc.z)));
-            set_cell_bel_pin(dsp_net_cnt.at(dsp).clk, id_CLK, dsp_data.dsp_clk->name, "CLK%d",
+            set_cell_bel_pin(dsp_info.at(dsp).clk, id_CLK, dsp_data.dsp_clk->name, "CLK%d",
                              ci->type == id_MULT36X36 ? "CLK%d%d" : nullptr);
         }
+    }
+}
+
+// GW5A HCLK
+// Each serializer/deserializer can use one of several HCLK wire from a block
+// (hclk_idx), but only from the specific block assigned to that
+// serializer/deserializer.
+// Each HCLK line can be routed through a CLKDIV2 primitive, which halves the signal frequency.
+//
+// Thus, if the SERDES uses CLKDIV2, the latter must be placed in the specific
+// HCLK block corresponding to the SERDES (since the SERDES is part of the I/O,
+// and we do not allow unconstrained I/O, the placement of the SERDES is always
+// known).
+//
+// Since users typically do not track which pins belong to which HCLK block,
+// situations may arise where a single CLKDIV2 divider in the design serves as
+// the signal source for SERDES located in different HCLK blocks, making it
+// impossible to connect them. Alternatively, some SERDES in one block may
+// receive the signal directly, while others receive it from the CLKDIV2.
+//
+// Here, we solve this by duplicating the CLKDIV2 cells and placing them
+// exactly where they serve specific HCLK blocks.
+//
+// Information regarding which IO corresponds to a specific HCLK, as well as
+// the placement of CLKDIV2 for that specific HCLK, is retrieved from the
+// chip's database.
+//
+// CLKDIV can be used either on its own or in conjunction with CLKDIV2;
+// however, in the latter case, there is only one CLKDIV2->CLKDIV connection,
+// and it is non-switchable. This makes it necessary to clone CLKDIV2 when
+// using it with multiple CLKDIVs.
+//
+void GowinImpl::place_5a_hclks(void)
+{
+    std::vector<std::unique_ptr<CellInfo>> new_cells;
+    // Cloned CLKDIV2 cells
+    dict<int, CellInfo *> clkdiv2_clones;
+    // CLKDIV cells
+    std::vector<CellInfo *> clkdiv_list;
+    // Which users need to be reconnected, and to where.
+    std::vector<std::pair<PortRef, CellInfo *>> users_to_reconect;
+    // CLKDIV2 allocator
+    dict<int, std::vector<Loc>> free_clkdiv2;
+
+    // SERDES can use any wire from the HCLK block; here, we select a wire from
+    // the unused ones and return the CLKDIV2 location that serves that wire.
+    auto alloc_clkdiv2 = [&](int hclk_idx, CellInfo *ci) -> Loc {
+        // first allocation for hclk_idx
+        if (!free_clkdiv2.count(hclk_idx)) {
+            std::vector<Loc> locs;
+            gwu.get_clkdiv2_locs(hclk_idx, locs);
+            free_clkdiv2[hclk_idx] = locs;
+        }
+
+        if (!free_clkdiv2.at(hclk_idx).size()) {
+            log_error("Can't place %s CLKDIV2.\n", ctx->nameOf(ci));
+        }
+        Loc loc = free_clkdiv2.at(hclk_idx).back();
+        free_clkdiv2.at(hclk_idx).pop_back();
+        return loc;
+    };
+
+    // If CLKDIV is used together with CLKDIV2, we should place them together.
+    auto make_clkdiv2_clkdiv_cluster = [&](CellInfo *ci, CellInfo *clkdiv) -> void {
+        if (ctx->debug) {
+            log_info("  Make cluster from %s and %s.\n", ctx->nameOf(ci), ctx->nameOf(clkdiv));
+        }
+
+        ci->cluster = ci->name;
+        ci->constr_abs_z = false;
+        ci->constr_children.push_back(clkdiv);
+
+        clkdiv->cluster = ci->name;
+        clkdiv->constr_abs_z = false;
+        clkdiv->constr_x = 0;
+        clkdiv->constr_y = 0;
+        clkdiv->constr_z = BelZ::CLKDIV_0_Z - BelZ::CLKDIV2_0_Z;
+    };
+
+    for (auto &cell : ctx->cells) {
+        auto ci = cell.second.get();
+
+        // The CLKDIV2s described in the design
+        if (is_clkdiv2(ci)) {
+            NetInfo *hclk_net = ci->getPort(id_CLKOUT);
+            if (!hclk_net || !ci->getPort(id_HCLKIN)) {
+                continue;
+            }
+            if (ctx->debug) {
+                log_info("  CLKDIV2 cell:%s, HCLKIN:%s, CLKOUT:%s\n", ctx->nameOf(ci),
+                         ctx->nameOf(ci->getPort(id_HCLKIN)), ctx->nameOf(hclk_net));
+            }
+
+            clkdiv2_clones.clear();
+            clkdiv_list.clear();
+            users_to_reconect.clear();
+            int cur_clkdiv2_hclk_idx = -1;
+
+            // CLKDIV and SERDES only
+            for (auto user : hclk_net->users) {
+                if (is_clkdiv(user.cell)) {
+                    clkdiv_list.push_back(user.cell);
+                }
+                if (!is_iologico(user.cell) && !is_iologici(user.cell)) {
+                    continue;
+                }
+                // checking users' hclk index
+                NPNR_ASSERT(user.cell->bel != BelId());
+                Loc user_loc = ctx->getBelLocation(user.cell->bel);
+                int hclk_idx = gwu.get_hclk_for_io(user_loc);
+                if (hclk_idx == -1) {
+                    log_error("%s can't use HCLK with %s.\n", ctx->nameOf(user.cell), ctx->nameOf(ci));
+                }
+
+                if (cur_clkdiv2_hclk_idx == -1) {
+                    // Place CLKDIV2
+                    cur_clkdiv2_hclk_idx = hclk_idx;
+                    BelId bel = ctx->getBelByLocation(alloc_clkdiv2(hclk_idx, ci));
+                    ctx->bindBel(bel, ci, PlaceStrength::STRENGTH_LOCKED);
+                    if (ctx->debug) {
+                        log_info("  @%s\n", ctx->nameOfBel(bel));
+                    }
+                    if (ctx->debug) {
+                        log_info("    hclk:%d - %s %s\n", hclk_idx, ctx->nameOfBel(user.cell->bel),
+                                 ctx->nameOf(user.cell));
+                    }
+                    continue;
+                }
+
+                // If the SERDES is in the current HCLK block, it remains there
+                if (cur_clkdiv2_hclk_idx == hclk_idx) {
+                    if (ctx->debug) {
+                        log_info("    hclk:%d - %s %s\n", hclk_idx, ctx->nameOfBel(user.cell->bel),
+                                 ctx->nameOf(user.cell));
+                    }
+                    continue;
+                }
+
+                // Since the SERDES is located in a different HCLK block, we
+                // need to create a copy of CLKDIV2 and save the SERDES
+                // for later connection to the copy.
+                CellInfo *new_clkdiv2;
+                if (clkdiv2_clones.count(hclk_idx)) {
+                    // already have clone
+                    new_clkdiv2 = clkdiv2_clones.at(hclk_idx);
+                } else {
+                    // create clone
+                    new_cells.push_back(gwu.create_cell(gwu.create_aux_name(ci->name, hclk_idx), id_CLKDIV2));
+                    new_clkdiv2 = new_cells.back().get();
+                    new_clkdiv2->addInput(id_HCLKIN);
+                    new_clkdiv2->addOutput(id_CLKOUT);
+                    clkdiv2_clones[hclk_idx] = new_clkdiv2;
+                    if (ctx->debug) {
+                        log_info("    create clone for hclk:%d - %s\n", hclk_idx, ctx->nameOf(new_clkdiv2));
+                    }
+                }
+                users_to_reconect.push_back(std::make_pair(user, new_clkdiv2));
+            }
+            // move the SERDES by connecting it to a copy of CLKDIV2
+            for (auto us_ci : users_to_reconect) {
+                PortRef user = us_ci.first;
+                CellInfo *new_clkdiv2 = us_ci.second;
+                if (ctx->debug) {
+                    log_info("   reconnect %s.%s to %s\n", ctx->nameOf(user.cell), user.port.c_str(ctx),
+                             ctx->nameOf(new_clkdiv2));
+                }
+                // input is same
+                if (!new_clkdiv2->getPort(id_HCLKIN)) {
+                    ci->copyPortTo(id_HCLKIN, new_clkdiv2, id_HCLKIN);
+                }
+                // move user
+                user.cell->disconnectPort(user.port);
+                new_clkdiv2->connectPorts(id_CLKOUT, user.cell, user.port);
+            }
+
+            // Place CLKDIV
+            if (clkdiv_list.size()) {
+                // First, the most common configuration: a single CLKDIV connected to former CLKDIV2
+                CellInfo *clkdiv = clkdiv_list.back();
+                clkdiv_list.pop_back();
+
+                // Place CLKDIV only if CLKDIV2 is placed
+                if (ci->bel != BelId()) {
+                    Loc loc = ctx->getBelLocation(ci->bel);
+                    loc.z = loc.z - BelZ::CLKDIV2_0_Z + BelZ::CLKDIV_0_Z;
+                    BelId bel = ctx->getBelByLocation(loc);
+                    ctx->bindBel(bel, clkdiv, PlaceStrength::STRENGTH_LOCKED);
+                } else {
+                    make_clkdiv2_clkdiv_cluster(ci, clkdiv);
+                }
+
+                // Connect the remaining CLKDIVs to the clones
+                int name_sfx = 0;
+                for (auto clkdiv : clkdiv_list) {
+                    CellInfo *clone;
+                    // If we have free clones
+                    if (clkdiv2_clones.size()) {
+                        clone = clkdiv2_clones.begin()->second;
+                        clkdiv2_clones.erase(clkdiv2_clones.begin());
+                    } else {
+                        // create clone
+                        ++name_sfx;
+                        new_cells.push_back(
+                                gwu.create_cell(gwu.create_aux_name(ci->name, name_sfx, "$for_clkdiv"), id_CLKDIV2));
+                        clone = new_cells.back().get();
+                        clone->addInput(id_HCLKIN);
+                        clone->addOutput(id_CLKOUT);
+                        // input is same
+                        ci->copyPortTo(id_HCLKIN, clone, id_HCLKIN);
+                    }
+                    clkdiv->disconnectPort(id_HCLKIN);
+                    clone->connectPorts(id_CLKOUT, clkdiv, id_HCLKIN);
+                }
+            }
+        }
+    }
+
+    // Place new CLKDIV2
+    for (auto &ncell : new_cells) {
+        CellInfo *ci = ncell.get();
+        NetInfo *hclk_net = ci->getPort(id_CLKOUT);
+        if (ctx->debug) {
+            log_info("  CLKDIV2 cell:%s, HCLKIN:%s, CLKOUT:%s\n", ctx->nameOf(ci), ctx->nameOf(ci->getPort(id_HCLKIN)),
+                     ctx->nameOf(hclk_net));
+        }
+
+        // If we have only one user, and that user is CLKDIV, then there are no
+        // strict restrictions on location; the only requirement is that they
+        // be co-located — so we create a cluster.
+        if (hclk_net->users.entries() == 1 && is_clkdiv((*hclk_net->users.begin()).cell)) {
+            make_clkdiv2_clkdiv_cluster(ci, (*hclk_net->users.begin()).cell);
+        } else {
+            // Any user can be used to determine hclk_idx because we connected them
+            // to copies of CLKDIV2 based precisely on the fact that hclk_idx is
+            // the same
+            PortRef &user = *hclk_net->users.begin();
+            Loc user_loc = ctx->getBelLocation(user.cell->bel);
+            int hclk_idx = gwu.get_hclk_for_io(user_loc);
+
+            BelId bel = ctx->getBelByLocation(alloc_clkdiv2(hclk_idx, ci));
+            ctx->bindBel(bel, ci, PlaceStrength::STRENGTH_LOCKED);
+            if (ctx->debug) {
+                log_info("  @%s\n", ctx->nameOfBel(bel));
+                log_info("    hclk:%d - %s %s\n", hclk_idx, ctx->nameOfBel(user.cell->bel), ctx->nameOf(user.cell));
+            }
+            // Place CLKDIV if any
+            for (auto user : hclk_net->users) {
+                if (is_clkdiv(user.cell)) {
+                    Loc loc = ctx->getBelLocation(ci->bel);
+                    loc.z = loc.z - BelZ::CLKDIV2_0_Z + BelZ::CLKDIV_0_Z;
+                    BelId bel = ctx->getBelByLocation(loc);
+                    ctx->bindBel(bel, user.cell, PlaceStrength::STRENGTH_LOCKED);
+                }
+            }
+        }
+        ctx->cells[ncell->name] = std::move(ncell);
     }
 }
 
@@ -324,6 +618,11 @@ void GowinImpl::adjust_dsp_pin_mapping(void)
 void GowinImpl::place_constrained_hclk_cells()
 {
     log_info("Running custom HCLK placer...\n");
+    if (gwu.has_5A_HCLK()) {
+        place_5a_hclks();
+        return;
+    }
+
     std::map<IdStringList, IdString> constrained_clkdivs;
     std::map<BelId, std::set<std::pair<IdString, int>>> bel_cell_map;
     std::vector<std::pair<IdString, int>> alias_cells;
@@ -596,12 +895,19 @@ void GowinImpl::place_constrained_hclk_cells()
 void GowinImpl::prePlace()
 {
     place_constrained_hclk_cells();
+    ctx->assignArchInfo();
     assign_cell_info();
+    fast_logic_cell.reset(ctx->getGridDimX(), ctx->getGridDimY());
+    for (auto bel : ctx->getBels()) {
+        if (ctx->getBelType(bel) == id_LUT4) {
+            Loc loc = ctx->getBelLocation(bel);
+            fast_logic_cell.at(loc.x, loc.y).resize(37);
+        }
+    }
 }
 
 void GowinImpl::postPlace()
 {
-    gwu.has_SP32();
     if (ctx->debug) {
         log_info("================== Final Placement ===================\n");
         for (auto &cell : ctx->cells) {
@@ -642,11 +948,21 @@ void GowinImpl::postRoute()
                         visited_hclk_users.insert(user.cell->name);
                         PipId up_pip = h_net->wires.at(ctx->getNetinfoSinkWire(h_net, user, 0)).pip;
                         IdString up_wire_name = ctx->getWireName(ctx->getPipSrcWire(up_pip))[1];
-                        if (up_wire_name.in(id_HCLK_OUT0, id_HCLK_OUT1, id_HCLK_OUT2, id_HCLK_OUT3)) {
-                            user.cell->setAttr(id_IOLOGIC_FCLK, Property(up_wire_name.str(ctx)));
-                            if (ctx->debug) {
-                                log_info("set IOLOGIC_FCLK to %s\n", up_wire_name.c_str(ctx));
+                        if (!gwu.has_5A_HCLK()) {
+                            if (up_wire_name.in(id_HCLK_OUT0, id_HCLK_OUT1, id_HCLK_OUT2, id_HCLK_OUT3)) {
+                                user.cell->setAttr(id_IOLOGIC_FCLK, Property(up_wire_name.str(ctx)));
+                                if (ctx->debug) {
+                                    log_info("set IOLOGIC_FCLK to %s\n", up_wire_name.c_str(ctx));
+                                }
                             }
+                        } else if (up_wire_name.in(id_HCLK00, id_HCLK10, id_HCLK20, id_HCLK30)) {
+                            user.cell->setAttr(id_IOLOGIC_FCLK, Property("HCLK_OUT0"));
+                        } else if (up_wire_name.in(id_HCLK01, id_HCLK11, id_HCLK21, id_HCLK31)) {
+                            user.cell->setAttr(id_IOLOGIC_FCLK, Property("HCLK_OUT1"));
+                        } else if (up_wire_name.in(id_HCLK02, id_HCLK12, id_HCLK22, id_HCLK32)) {
+                            user.cell->setAttr(id_IOLOGIC_FCLK, Property("HCLK_OUT2"));
+                        } else if (up_wire_name.in(id_HCLK03, id_HCLK13, id_HCLK23, id_HCLK33)) {
+                            user.cell->setAttr(id_IOLOGIC_FCLK, Property("HCLK_OUT3"));
                         }
                         if (ctx->debug) {
                             log_info("HCLK user cell:%s, port:%s, wire:%s, pip:%s, up wire:%s\n",
@@ -692,6 +1008,19 @@ void GowinImpl::postRoute()
             }
         }
     }
+    std::vector<CellInfo *> to_remove;
+    for (auto &cell : ctx->cells) {
+        CellInfo *ci = cell.second.get();
+        if (ci->type.in(id_BLOCKER_LUT, id_BLOCKER_FF)) {
+            to_remove.push_back(ci);
+        }
+    }
+    for (auto ci : to_remove) {
+        auto root = ctx->cells.at(ci->cluster).get();
+        root->constr_children.erase(std::remove_if(root->constr_children.begin(), root->constr_children.end(),
+                                                   [&](CellInfo *c) { return c == ci; }));
+        ctx->cells.erase(ci->name);
+    }
 }
 
 bool GowinImpl::isBelLocationValid(BelId bel, bool explain_invalid) const
@@ -720,6 +1049,7 @@ bool GowinImpl::isBelLocationValid(BelId bel, bool explain_invalid) const
     case ID_PADD9:           /* fall-through */
     case ID_PADD18:          /* fall-through */
     case ID_MULT9X9:         /* fall-through */
+    case ID_MULT12X12:       /* fall-through */
     case ID_MULT18X18:       /* fall-through */
     case ID_MULTADDALU18X18: /* fall-through */
     case ID_MULTALU18X18:    /* fall-through */
@@ -729,6 +1059,9 @@ bool GowinImpl::isBelLocationValid(BelId bel, bool explain_invalid) const
         return dsp_valid(l, bel_type, explain_invalid);
     case ID_CLKDIV2: /* fall-through */
     case ID_CLKDIV:
+        if (gwu.has_5A_HCLK()) {
+            return true;
+        }
         return hclk_valid(bel, bel_type);
     }
     return true;
@@ -743,10 +1076,10 @@ IdString GowinImpl::getBelBucketForCellType(IdString cell_type) const
     if (cell_type.in(id_MIPI_OBUF, id_MIPI_OBUF_A)) {
         return id_MIPI_OBUF;
     }
-    if (type_is_lut(cell_type)) {
+    if (type_is_lut(cell_type) || cell_type == id_BLOCKER_LUT) {
         return id_LUT4;
     }
-    if (type_is_dff(cell_type)) {
+    if (type_is_dff(cell_type) || cell_type == id_BLOCKER_FF) {
         return id_DFF;
     }
     if (type_is_ssram(cell_type)) {
@@ -784,10 +1117,10 @@ bool GowinImpl::isValidBelForCellType(IdString cell_type, BelId bel) const
         return cell_type.in(id_MIPI_OBUF, id_MIPI_OBUF_A);
     }
     if (bel_type == id_LUT4) {
-        return type_is_lut(cell_type);
+        return type_is_lut(cell_type) || cell_type == id_BLOCKER_LUT;
     }
     if (bel_type == id_DFF) {
-        return type_is_dff(cell_type);
+        return type_is_dff(cell_type) || cell_type == id_BLOCKER_FF;
     }
     if (bel_type == id_RAM16SDP4) {
         return type_is_ssram(cell_type);
@@ -852,6 +1185,12 @@ void GowinImpl::assign_cell_info()
             fc.dsp_asel = get_net(id_ASEL);
             fc.dsp_bsel = get_net(id_BSEL);
             fc.dsp_soa_reg = ci->params.count(id_SOA_REG) && ci->params.at(id_SOA_REG).as_int64() == 1;
+            fc.dsp_5a_clk0 = get_net(id_CLK0);
+            fc.dsp_5a_clk1 = get_net(id_CLK1);
+            fc.dsp_5a_ce0 = get_net(id_CE0);
+            fc.dsp_5a_ce1 = get_net(id_CE1);
+            fc.dsp_5a_reset0 = get_net(id_RESET0);
+            fc.dsp_5a_reset1 = get_net(id_RESET1);
         }
     }
 }
@@ -940,6 +1279,17 @@ bool GowinImpl::dsp_valid(Loc l, IdString bel_type, bool explain_invalid) const
 {
     const CellInfo *dsp = ctx->getBoundBelCell(ctx->getBelByLocation(l));
     const auto &dsp_data = fast_cell_info.at(dsp->flat_index);
+
+    BelId dsp_macro_bel = ctx->getBelByLocation(Loc(l.x, l.y, gwu.get_dsp_macro(l.z)));
+    if (dsp_info.count(dsp_macro_bel)) {
+        if (dsp_info.at(dsp_macro_bel).mode9bit && dsp_info.at(dsp_macro_bel).mode18bit) {
+            if (explain_invalid) {
+                log_nonfatal_error("Different operand lengths (9 and 18) are not permitted in one DSP macro.\n");
+            }
+            return false;
+        }
+    }
+
     // check for shift out register - there is only one for macro
     if (dsp_data.dsp_soa_reg) {
         if (l.z == BelZ::MULT18X18_0_1_Z || l.z == BelZ::MULT18X18_1_1_Z || l.z == BelZ::MULT9X9_0_0_Z ||
@@ -968,17 +1318,38 @@ bool GowinImpl::dsp_valid(Loc l, IdString bel_type, bool explain_invalid) const
             }
         }
     }
+
+    if (bel_type == id_MULT12X12) {
+        int pair_z = gwu.get_dsp_paired_12(l.z);
+        const CellInfo *adj_dsp12 = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(l.x, l.y, pair_z)));
+        if (adj_dsp12 != nullptr) {
+            const auto &adj_dsp12_data = fast_cell_info.at(adj_dsp12->flat_index);
+            if ((dsp_data.dsp_5a_clk0 != adj_dsp12_data.dsp_5a_clk0) ||
+                (dsp_data.dsp_5a_clk1 != adj_dsp12_data.dsp_5a_clk1) ||
+                (dsp_data.dsp_5a_ce0 != adj_dsp12_data.dsp_5a_ce0) ||
+                (dsp_data.dsp_5a_ce1 != adj_dsp12_data.dsp_5a_ce1) ||
+                (dsp_data.dsp_5a_reset0 != adj_dsp12_data.dsp_5a_reset0) ||
+                (dsp_data.dsp_5a_reset1 != adj_dsp12_data.dsp_5a_reset1)) {
+                if (explain_invalid) {
+                    log_nonfatal_error("For MULT12X12 primitives the control signals must be same.\n");
+                }
+                return false;
+            }
+        }
+    }
+
     // check for control nets "overflow"
     BelId dsp_bel = ctx->getBelByLocation(Loc(l.x, l.y, BelZ::DSP_Z));
-    if (dsp_net_cnt.at(dsp_bel).reset.size() > 4) {
-        if (explain_invalid) {
-            log_nonfatal_error("More than 4 different networks for RESET signals in one DSP are not allowed.\n");
+    if (dsp_info.count(dsp_bel)) {
+        if (dsp_info.at(dsp_bel).reset.size() > 4) {
+            if (explain_invalid) {
+                log_nonfatal_error("More than 4 different networks for RESET signals in one DSP are not allowed.\n");
+            }
+            return false;
         }
-        return false;
     }
-    BelId dsp_macro_bel = ctx->getBelByLocation(Loc(l.x, l.y, gwu.get_dsp_macro(l.z)));
-    if (dsp_net_cnt.count(dsp_macro_bel)) {
-        if (dsp_net_cnt.at(dsp_macro_bel).ce.size() > 4 || dsp_net_cnt.at(dsp_macro_bel).clk.size() > 4) {
+    if (dsp_info.count(dsp_macro_bel)) {
+        if (dsp_info.at(dsp_macro_bel).ce.size() > 4 || dsp_info.at(dsp_macro_bel).clk.size() > 4) {
             if (explain_invalid) {
                 log_nonfatal_error(
                         "More than 4 different networks for CE or CLK signals in one DSP macro are not allowed.\n");
@@ -991,33 +1362,38 @@ bool GowinImpl::dsp_valid(Loc l, IdString bel_type, bool explain_invalid) const
 
 bool GowinImpl::slice_valid(int x, int y, int z) const
 {
-    const CellInfo *lut = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, z * 2)));
-    const CellInfo *ff = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, z * 2 + 1)));
+    auto &bels = fast_logic_cell.at(x, y);
+    const CellInfo *lut = bels.at(z * 2);
+    const CellInfo *ff = bels.at(z * 2 + 1);
     // There are only 6 ALUs
-    const CellInfo *alu = (z < 6) ? ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, z + BelZ::ALU0_Z))) : nullptr;
-    const CellInfo *ramw = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, BelZ::RAMW_Z)));
+    const CellInfo *alu = (z < 6) ? bels.at(z + BelZ::ALU0_Z) : nullptr;
+    const CellInfo *ramw = bels.at(BelZ::RAMW_Z);
 
-    if (alu && lut) {
+    auto is_not_blocker = [](const CellInfo *ci) { return ci && !ci->type.in(id_BLOCKER_LUT, id_BLOCKER_FF); };
+
+    if (alu && lut && lut->type != id_BLOCKER_LUT) {
         return false;
     }
 
     if (ramw) {
         // FFs in slices 4 and 5 are not allowed
         // also temporarily disallow FF to be placed near RAM
-        if (ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, 0 * 2 + 1))) ||
-            ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, 1 * 2 + 1))) ||
-            ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, 2 * 2 + 1))) ||
-            ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, 3 * 2 + 1))) ||
-            ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, 4 * 2 + 1))) ||
-            ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, 5 * 2 + 1)))) {
+        if (is_not_blocker(bels.at(0 * 2 + 1)) || is_not_blocker(bels.at(1 * 2 + 1)) ||
+            is_not_blocker(bels.at(2 * 2 + 1)) || is_not_blocker(bels.at(3 * 2 + 1)) ||
+            is_not_blocker(bels.at(4 * 2 + 1)) || is_not_blocker(bels.at(5 * 2 + 1))) {
             return false;
+        }
+        if (gwu.has_DFF67()) {
+            if (is_not_blocker(bels.at(6 * 2 + 1)) || is_not_blocker(bels.at(7 * 2 + 1))) {
+                return false;
+            }
         }
         // ALU/LUTs in slices 4, 5, 6, 7 are not allowed
         for (int i = 4; i < 8; ++i) {
-            if (ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, i * 2)))) {
+            if (is_not_blocker(bels.at(i * 2))) {
                 return false;
             }
-            if (i < 6 && ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, i + BelZ::ALU0_Z)))) {
+            if (i < 6 && bels.at(i + BelZ::ALU0_Z)) {
                 return false;
             }
         }
@@ -1026,17 +1402,16 @@ bool GowinImpl::slice_valid(int x, int y, int z) const
     // check for ALU/LUT in the adjacent cell
     int adj_lut_z = (1 - (z & 1) * 2 + z) * 2;
     int adj_alu_z = adj_lut_z / 2 + BelZ::ALU0_Z;
-    const CellInfo *adj_lut = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, adj_lut_z)));
-    const CellInfo *adj_ff = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, adj_lut_z + 1)));
-    const CellInfo *adj_alu = adj_alu_z < (6 + BelZ::ALU0_Z)
-                                      ? ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, adj_alu_z)))
-                                      : nullptr;
+    const CellInfo *adj_lut = bels.at(adj_lut_z);
+    const CellInfo *adj_ff = bels.at(adj_lut_z + 1);
+    const CellInfo *adj_alu = adj_alu_z < (6 + BelZ::ALU0_Z) ? bels.at(adj_alu_z) : nullptr;
 
-    if ((alu && (adj_lut || (adj_ff && !adj_alu))) || ((lut || (ff && !alu)) && adj_alu)) {
+    if ((alu && ((adj_lut && adj_lut->type != id_BLOCKER_LUT) || (adj_ff && !adj_alu))) ||
+        (((lut && lut->type != id_BLOCKER_LUT) || (ff && !alu)) && adj_alu)) {
         return false;
     }
 
-    if (ff) {
+    if (ff && ff->type != id_BLOCKER_FF) {
         static std::vector<int> mux_z = {BelZ::MUX20_Z,     BelZ::MUX21_Z,     BelZ::MUX20_Z + 4,  BelZ::MUX23_Z,
                                          BelZ::MUX20_Z + 8, BelZ::MUX21_Z + 8, BelZ::MUX20_Z + 12, BelZ::MUX27_Z};
         const auto &ff_data = fast_cell_info.at(ff->flat_index);
@@ -1044,7 +1419,7 @@ bool GowinImpl::slice_valid(int x, int y, int z) const
         // check implcit LUT(ALU) -> FF connection
         NPNR_ASSERT(!ramw); // XXX shouldn't happen for now
         if (lut || alu) {
-            if (lut) {
+            if (lut && lut->type != id_BLOCKER_LUT) {
                 src = fast_cell_info.at(lut->flat_index).lut_f;
             } else {
                 src = fast_cell_info.at(alu->flat_index).alu_sum;
@@ -1075,7 +1450,7 @@ bool GowinImpl::slice_valid(int x, int y, int z) const
             // The 4th, 5th, 6th, and 7th DFFs have the same control wires. Let's check this.
             const int adj_top_ff_z = (5 - (z >> 1)) * 4 + 1;
             for (int i = 0; i < 4; i += 2) {
-                const CellInfo *adj_top_ff = ctx->getBoundBelCell(ctx->getBelByLocation(Loc(x, y, adj_top_ff_z + i)));
+                const CellInfo *adj_top_ff = bels.at(adj_top_ff_z + i);
                 if (adj_top_ff) {
                     const auto &adj_top_ff_data = fast_cell_info.at(adj_top_ff->flat_index);
                     if (adj_top_ff_data.ff_lsr != ff_data.ff_lsr) {
@@ -1148,7 +1523,7 @@ bool GowinImpl::getClusterPlacement(ClusterId cluster, BelId root_bel,
 {
     CellInfo *root_ci = getClusterRootCell(cluster);
     if (!root_ci->type.in(id_PADD9, id_MULT9X9, id_PADD18, id_MULT18X18, id_MULTALU18X18, id_MULTALU36X18,
-                          id_MULTADDALU18X18, id_ALU54D)) {
+                          id_MULTADDALU18X18, id_ALU54D, id_MULTADDALU12X12, id_MULTALU27X18)) {
         return HimbaechelAPI::getClusterPlacement(cluster, root_bel, placement);
     }
 
@@ -1189,6 +1564,22 @@ bool GowinImpl::getClusterPlacement(ClusterId cluster, BelId root_bel,
 
 void GowinImpl::notifyBelChange(BelId bel, CellInfo *cell)
 {
+
+    IdString bel_type = ctx->getBelType(bel);
+    switch (bel_type.hash()) {
+    case ID_LUT4: /* fall-through */
+    case ID_DFF:
+    case ID_ALU:
+    case ID_RAM16SDP4:
+    case ID_MUX2_LUT5:
+    case ID_MUX2_LUT6:
+    case ID_MUX2_LUT7:
+    case ID_MUX2_LUT8:
+        auto loc = ctx->getBelLocation(bel);
+        fast_logic_cell.at(loc.x, loc.y).at(loc.z) = cell;
+        return;
+    }
+
     if (cell != nullptr && !is_dsp(cell)) {
         return;
     }
@@ -1209,30 +1600,108 @@ void GowinImpl::notifyBelChange(BelId bel, CellInfo *cell)
     BelId dsp_macro = ctx->getBelByLocation(l);
 
     if (cell) {
+        bool mode9 = cell_type.in(id_PADD9, id_MULT9X9);
+        if (mode9) {
+            dsp_info[dsp_macro].mode9bit++;
+        } else {
+            dsp_info[dsp_macro].mode18bit++;
+        }
+
         const auto &dsp_cell_data = fast_cell_info.at(cell->flat_index);
         if (dsp_cell_data.dsp_reset != nullptr) {
-            dsp_net_cnt[dsp].reset[dsp_cell_data.dsp_reset->name]++;
+            dsp_info[dsp].reset[dsp_cell_data.dsp_reset->name]++;
         }
         if (dsp_cell_data.dsp_ce != nullptr) {
-            dsp_net_cnt[dsp_macro].ce[dsp_cell_data.dsp_ce->name]++;
+            dsp_info.at(dsp_macro).ce[dsp_cell_data.dsp_ce->name]++;
         }
         if (dsp_cell_data.dsp_clk != nullptr) {
-            dsp_net_cnt[dsp_macro].clk[dsp_cell_data.dsp_clk->name]++;
+            dsp_info.at(dsp_macro).clk[dsp_cell_data.dsp_clk->name]++;
         }
         dsp_bel2cell[bel] = cell;
     } else {
+        bool mode9 = dsp_bel2cell.at(bel)->type.in(id_PADD9, id_MULT9X9);
+        if (mode9) {
+            dsp_info.at(dsp_macro).mode9bit--;
+        } else {
+            dsp_info.at(dsp_macro).mode18bit--;
+        }
+
         const auto &dsp_cell_data = fast_cell_info.at(dsp_bel2cell.at(bel)->flat_index);
         if (dsp_cell_data.dsp_reset != nullptr) {
-            dsp_net_cnt.at(dsp).reset.at(dsp_cell_data.dsp_reset->name)--;
+            dsp_info.at(dsp).reset.at(dsp_cell_data.dsp_reset->name)--;
         }
         if (dsp_cell_data.dsp_ce != nullptr) {
-            dsp_net_cnt.at(dsp_macro).ce.at(dsp_cell_data.dsp_ce->name)--;
+            dsp_info.at(dsp_macro).ce.at(dsp_cell_data.dsp_ce->name)--;
         }
         if (dsp_cell_data.dsp_clk != nullptr) {
-            dsp_net_cnt.at(dsp_macro).clk.at(dsp_cell_data.dsp_clk->name)--;
+            dsp_info.at(dsp_macro).clk.at(dsp_cell_data.dsp_clk->name)--;
         }
         dsp_bel2cell.erase(bel);
     }
+}
+
+void GowinImpl::configurePlacerHeap(PlacerHeapCfg &cfg)
+{
+    // Use cell groups to enforce a legalisation order
+    cfg.cellGroups.emplace_back();
+    cfg.cellGroups.back().insert(id_RAM16SDP4);
+    cfg.cellGroups.emplace_back();
+    cfg.cellGroups.back().insert(id_ALU);
+
+    cfg.placeAllAtOnce = true;
+
+    // Treat control and constants like IO buffers, because they have only one possible location
+    cfg.ioBufTypes.insert(id_GOWIN_VCC);
+    cfg.ioBufTypes.insert(id_GOWIN_GND);
+    cfg.ioBufTypes.insert(id_PINCFG);
+    cfg.ioBufTypes.insert(id_GSR);
+}
+
+void GowinImpl::drawBel(std::vector<GraphicElement> &g, GraphicElement::style_t style, IdString bel_type, Loc loc)
+{
+    GraphicElement el;
+    el.type = GraphicElement::TYPE_BOX;
+    el.style = style;
+    switch (bel_type.index) {
+    case id_LUT4.index:
+        el.x1 = loc.x + 0.75;
+        el.x2 = el.x1 + 0.08;
+        el.y1 = loc.y + 0.1 + 0.1 * (loc.z / 2);
+        el.y2 = el.y1 + 0.04;
+        g.push_back(el);
+        break;
+    case id_ALU.index:
+        el.x1 = loc.x + 0.75;
+        el.x2 = el.x1 + 0.08;
+        el.y1 = loc.y + 0.1 + 0.1 * (loc.z - BelZ::ALU0_Z);
+        el.y2 = el.y1 + 0.04;
+        g.push_back(el);
+        break;
+    case id_DFF.index:
+        el.x1 = loc.x + 0.9;
+        el.x2 = el.x1 + 0.02;
+        el.y1 = loc.y + 0.1 + 0.1 * (loc.z / 2);
+        el.y2 = el.y1 + 0.04;
+        g.push_back(el);
+        break;
+    case id_RAM16SDP4.index:
+        el.x1 = loc.x + 0.85;
+        el.x2 = el.x1 + 0.01;
+        el.y1 = loc.y + 0.1;
+        el.y2 = el.y1 + 0.65;
+        g.push_back(el);
+        break;
+    }
+}
+
+delay_t GowinImpl::estimateDelay(WireId src, WireId dst) const
+{
+    int sx, sy, dx, dy;
+    tile_xy(ctx->chip_info, src.tile, sx, sy);
+    tile_xy(ctx->chip_info, dst.tile, dx, dy);
+    int dist_x = std::abs(dx - sx), dist_y = std::abs(dy - sy);
+    return delay_c + delay_m * (std::max(dist_x - 4, 0) + std::max(dist_y - 4, 0) +
+                                2 * (std::min(dist_x, 4) + std::min(dist_y, 4)));
 }
 
 } // namespace

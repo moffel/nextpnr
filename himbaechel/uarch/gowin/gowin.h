@@ -16,6 +16,12 @@ inline bool type_is_dff(IdString cell_type)
                         id_DFFNR, id_DFFNRE, id_DFFP, id_DFFPE, id_DFFNP, id_DFFNPE, id_DFFC, id_DFFCE, id_DFFNC,
                         id_DFFNCE);
 }
+// Return true if a cell is a latch (before packing converts them to DFFs)
+inline bool type_is_latch(IdString cell_type)
+{
+    return cell_type.in(id_DL, id_DLE, id_DLN, id_DLNE, id_DLC, id_DLCE, id_DLNC, id_DLNCE, id_DLP, id_DLPE, id_DLNP,
+                        id_DLNPE);
+}
 inline bool is_dff(const CellInfo *cell) { return type_is_dff(cell->type); }
 // Return true if a cell is a ALU
 inline bool type_is_alu(IdString cell_type) { return cell_type == id_ALU; }
@@ -28,7 +34,7 @@ inline bool is_io(const CellInfo *cell) { return type_is_io(cell->type); }
 inline bool type_is_diffio(IdString cell_type)
 {
     return cell_type.in(id_ELVDS_IOBUF, id_ELVDS_IBUF, id_ELVDS_TBUF, id_ELVDS_OBUF, id_TLVDS_IOBUF, id_TLVDS_IBUF,
-                        id_TLVDS_TBUF, id_TLVDS_OBUF);
+                        id_TLVDS_TBUF, id_TLVDS_OBUF, id_TLVDS_IBUF_ADC);
 }
 inline bool is_diffio(const CellInfo *cell) { return type_is_diffio(cell->type); }
 
@@ -73,7 +79,8 @@ inline bool is_bsram(const CellInfo *cell) { return type_is_bsram(cell->type); }
 inline bool type_is_dsp(IdString cell_type)
 {
     return cell_type.in(id_PADD9, id_PADD18, id_MULT9X9, id_MULT18X18, id_MULT36X36, id_ALU54D, id_MULTALU18X18,
-                        id_MULTALU36X18, id_MULTADDALU18X18);
+                        id_MULTALU36X18, id_MULTADDALU18X18, id_MULT12X12, id_MULTADDALU12X12, id_MULTALU27X18,
+                        id_MULT27X36);
 }
 inline bool is_dsp(const CellInfo *cell) { return type_is_dsp(cell->type); }
 
@@ -99,6 +106,10 @@ inline bool is_userflash(const CellInfo *cell) { return type_is_userflash(cell->
 // Return true if a cell is a PLL
 inline bool type_is_pll(IdString cell_type) { return cell_type.in(id_rPLL, id_PLLVR); }
 inline bool is_pll(const CellInfo *cell) { return type_is_pll(cell->type); }
+
+// Return true if a cell is a ADC
+inline bool type_is_adc(IdString cell_type) { return cell_type.in(id_ADC); }
+inline bool is_adc(const CellInfo *cell) { return type_is_adc(cell->type); }
 
 // Return true if a cell is a EMCU
 inline bool type_is_emcu(IdString cell_type) { return cell_type == id_EMCU; }
@@ -172,6 +183,14 @@ NPNR_PACKED_STRUCT(struct Segment_POD {
     RelSlice<uint32_t> bottom_gate_wire;
 });
 
+NPNR_PACKED_STRUCT(struct SpineSelectWire_POD {
+    uint32_t spine;
+    int16_t x;
+    int16_t y;
+    uint32_t wire;
+    uint32_t vcc_gnd;
+});
+
 NPNR_PACKED_STRUCT(struct Constraint_POD {
     int32_t net;
     int32_t row;
@@ -180,11 +199,26 @@ NPNR_PACKED_STRUCT(struct Constraint_POD {
     int32_t iostd;
 });
 
+NPNR_PACKED_STRUCT(struct Io2Hclk_POD {
+    int16_t x;
+    int16_t y;
+    int32_t hclk_idx;
+});
+
+NPNR_PACKED_STRUCT(struct HclkDiv2_POD {
+    int16_t hclk_idx;
+    int16_t x;
+    int16_t y;
+    int16_t z;
+});
+
 NPNR_PACKED_STRUCT(struct Extra_package_data_POD { RelSlice<Constraint_POD> cst; });
 
 NPNR_PACKED_STRUCT(struct Extra_chip_data_POD {
     int32_t chip_flags;
     int32_t dcs_prefix;
+    int16_t center_row;
+    int16_t center_col;
     Bottom_io_POD bottom_io;
     RelSlice<IdString> diff_io_types;
     RelSlice<Spine_bel_POD> dqce_bels;
@@ -192,6 +226,11 @@ NPNR_PACKED_STRUCT(struct Extra_chip_data_POD {
     RelSlice<Wire_bel_POD> dhcen_bels;
     RelSlice<Io_dlldly_bel_POD> io_dlldly_bels;
     RelSlice<Segment_POD> segments;
+    RelSlice<SpineSelectWire_POD> spine_select_wires_top;
+    RelSlice<SpineSelectWire_POD> spine_select_wires_bottom;
+    RelSlice<Io2Hclk_POD> io_to_hclk;
+    RelSlice<HclkDiv2_POD> hclk_div2;
+
     // chip flags
     static constexpr int32_t HAS_SP32 = 1;
     static constexpr int32_t NEED_SP_FIX = 2;
@@ -205,6 +244,11 @@ NPNR_PACKED_STRUCT(struct Extra_chip_data_POD {
     static constexpr int32_t HAS_CIN_MUX = 512;
     static constexpr int32_t NEED_BSRAM_RESET_FIX = 1024;
     static constexpr int32_t NEED_SDP_FIX = 2048;
+    static constexpr int32_t NEED_CFGPINS_INVERSION = 4096;
+    static constexpr int32_t HAS_I2CCFG = 8192;
+    static constexpr int32_t HAS_5A_DSP = 16384;
+    static constexpr int32_t NEED_BSRAM_DP_CE_FIX = 32768;
+    static constexpr int32_t HAS_5A_HCLK = 65536;
 });
 
 } // namespace
@@ -253,6 +297,8 @@ enum
     DLLDLY_Z = 303, // : 305 reserve for 2 DLLDLYs
 
     PINCFG_Z = 400,
+
+    ADC_Z = 401,
 
     // The two least significant bits encode Z for 9-bit adders and
     // multipliers, if they are equal to 0, then we get Z of their common
@@ -310,7 +356,12 @@ enum
     CLKDIV_0_Z = 620,
     CLKDIV_1_Z = 621,
     CLKDIV_2_Z = 622,
-    CLKDIV_3_Z = 623
+    CLKDIV_3_Z = 623,
+
+    MULT12X12_0_Z = 640,
+    MULT12X12_1_Z = 641,
+    MULTADDALU12X12_Z = 642,
+    MULTALU27X18_Z = 643,
 };
 }
 

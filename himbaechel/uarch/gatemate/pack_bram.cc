@@ -417,10 +417,10 @@ void GateMatePacker::pack_ram()
             move_ram_o(&ci, ctx->idf("ENB[%d]", i));
             move_ram_o(&ci, ctx->idf("GLWEA[%d]", i));
             move_ram_o(&ci, ctx->idf("GLWEB[%d]", i));
-            move_ram_o(&ci, ctx->idf("ECC1B_ERRA[%d]", i));
-            move_ram_o(&ci, ctx->idf("ECC1B_ERRB[%d]", i));
-            move_ram_o(&ci, ctx->idf("ECC2B_ERRA[%d]", i));
-            move_ram_o(&ci, ctx->idf("ECC2B_ERRB[%d]", i));
+            move_ram_i(&ci, ctx->idf("ECC1B_ERRA[%d]", i));
+            move_ram_i(&ci, ctx->idf("ECC1B_ERRB[%d]", i));
+            move_ram_i(&ci, ctx->idf("ECC2B_ERRA[%d]", i));
+            move_ram_i(&ci, ctx->idf("ECC2B_ERRB[%d]", i));
         }
 
         if (is_fifo) {
@@ -577,10 +577,14 @@ void GateMatePacker::repack_ram()
         for (int i = 63; i >= 0; i--) {
             std::vector<bool> orig_first;
             if (ram.second.first)
-                orig_first = ram.second.first->params.at(ctx->idf("INIT_%02X", i)).extract(0, 320).as_bits();
+                orig_first = get_or_default(ram.second.first->params, ctx->idf("INIT_%02X", i), Property())
+                                     .extract(0, 320)
+                                     .as_bits();
             std::vector<bool> orig_second;
             if (ram.second.second)
-                orig_second = ram.second.second->params.at(ctx->idf("INIT_%02X", i)).extract(0, 320).as_bits();
+                orig_second = get_or_default(ram.second.second->params, ctx->idf("INIT_%02X", i), Property())
+                                      .extract(0, 320)
+                                      .as_bits();
             std::string init[2];
 
             for (int j = 0; j < 2; j++) {

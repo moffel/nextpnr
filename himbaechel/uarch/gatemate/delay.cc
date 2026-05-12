@@ -90,14 +90,20 @@ bool GateMateImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdStrin
 {
     delay = DelayQuad{0};
     static dict<IdString, IdString> map_upper = {
-            {id_OUT, id_OUT2},
-            {id_RAM_O, id_RAM_O2},
-            {id_RAM_I, id_RAM_I2},
-            {id_CPOUT, id_CPOUT2},
+            {id_D0_00, id_IN1}, {id_D1_00, id_IN2}, {id_D0_01, id_IN3},    {id_D1_01, id_IN4},    {id_D0_10, id_IN1},
+            {id_D1_10, id_IN3}, {id_OUT, id_OUT2},  {id_RAM_O, id_RAM_O2}, {id_RAM_I, id_RAM_I2}, {id_CPOUT, id_CPOUT2},
     };
     static dict<IdString, IdString> map_lower = {
-            {id_OUT, id_OUT1}, {id_RAM_O, id_RAM_O1}, {id_RAM_I, id_RAM_I1}, {id_CPOUT, id_CPOUT1},
-            {id_IN1, id_IN5},  {id_IN2, id_IN6},      {id_IN3, id_IN7},      {id_IN4, id_IN8},
+            {id_D0_00, id_IN5},    {id_D1_00, id_IN6}, {id_D0_01, id_IN7}, {id_D1_01, id_IN8},    {id_D0_10, id_IN5},
+            {id_D1_10, id_IN7},    {id_D0_02, id_IN5}, {id_D1_02, id_IN6}, {id_D0_03, id_IN7},    {id_D1_03, id_IN8},
+            {id_D0_11, id_IN5},    {id_D1_11, id_IN7}, {id_OUT, id_OUT1},  {id_RAM_O, id_RAM_O1}, {id_RAM_I, id_RAM_I1},
+            {id_CPOUT, id_CPOUT1}, {id_IN1, id_IN5},   {id_IN2, id_IN6},   {id_IN3, id_IN7},      {id_IN4, id_IN8},
+    };
+
+    static dict<IdString, IdString> map_both = {
+            {id_D0_00, id_IN1}, {id_D1_00, id_IN2}, {id_D0_01, id_IN3}, {id_D1_01, id_IN4},
+            {id_D0_10, id_IN1}, {id_D1_10, id_IN3}, {id_D0_02, id_IN5}, {id_D1_02, id_IN6},
+            {id_D0_03, id_IN7}, {id_D1_03, id_IN8}, {id_D0_11, id_IN5}, {id_D1_11, id_IN7},
     };
 
     int z = (cell->bel != BelId()) ? (ctx->getBelLocation(cell->bel).z % 2) : 0;
@@ -116,10 +122,24 @@ bool GateMateImpl::getCellDelay(const CellInfo *cell, IdString fromPort, IdStrin
         }
         return get_delay_from_tmg_db(ctx->idf("timing__ARBLUT_%s_%s", fp.c_str(ctx), tp.c_str(ctx)), delay);
     } else if (cell->type.in(id_CPE_ADDF, id_CPE_ADDF2)) {
-        return get_delay_from_tmg_db(ctx->idf("timing__ADDF2Y1_%s_%s", fromPort.c_str(ctx), toPort.c_str(ctx)), delay);
+        IdString fp = fromPort, tp = toPort;
+        if (map_both.count(fp))
+            fp = map_both[fp];
+        if (map_both.count(tp))
+            tp = map_both[tp];
+        return get_delay_from_tmg_db(ctx->idf("timing__ADDF2Y1_%s_%s", fp.c_str(ctx), tp.c_str(ctx)), delay);
     } else if (cell->type.in(id_CPE_MX4)) {
-        return get_delay_from_tmg_db(ctx->idf("timing__MX4A_%s_%s", fromPort.c_str(ctx), toPort.c_str(ctx)), delay);
+        IdString fp = fromPort, tp = toPort;
+        if (map_both.count(fp))
+            fp = map_both[fp];
+        if (map_both.count(tp))
+            tp = map_both[tp];
+        return get_delay_from_tmg_db(ctx->idf("timing__MX4A_%s_%s", fp.c_str(ctx), tp.c_str(ctx)), delay);
     } else if (cell->type.in(id_CPE_MULT)) {
+        if (toPort == id_CPOUT1)
+            return get_delay_from_tmg_db(ctx->id("timing_cpout_OUT1"), delay);
+        if (toPort == id_CPOUT2)
+            return get_delay_from_tmg_db(ctx->id("timing_cpout_OUT2"), delay);
         return get_delay_from_tmg_db(ctx->idf("timing__MULT_%s_%s", fromPort.c_str(ctx), toPort.c_str(ctx)), delay);
     } else if (cell->type.in(id_CPE_FF, id_CPE_LATCH, id_CPE_FF_L, id_CPE_FF_U)) {
         return false;
@@ -183,22 +203,29 @@ TimingPortClass GateMateImpl::getPortTimingClass(const CellInfo *cell, IdString 
     auto disconnected = [cell](IdString p) { return !cell->ports.count(p) || cell->ports.at(p).net == nullptr; };
     clockInfoCount = 0;
     if (cell->type.in(id_CPE_L2T4, id_CPE_LT_L, id_CPE_LT_U)) {
-        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_COMBIN, id_CINY1, id_CINY2, id_CINX, id_PINX))
+        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_COMBIN, id_CINY1, id_CINY2, id_CINX, id_PINX, id_D0_00, id_D1_00,
+                    id_D0_01, id_D1_01, id_D0_10, id_D1_10, id_D0_02, id_D1_02, id_D0_03, id_D1_03, id_D0_11, id_D1_11))
             return TMG_COMB_INPUT;
         if (port == id_OUT && disconnected(id_IN1) && disconnected(id_IN2) && disconnected(id_IN3) &&
-            disconnected(id_IN4))
+            disconnected(id_IN4) && disconnected(id_D0_00) && disconnected(id_D1_00) && disconnected(id_D0_01) &&
+            disconnected(id_D1_01) && disconnected(id_D0_10) && disconnected(id_D1_10) && disconnected(id_D0_02) &&
+            disconnected(id_D1_02) && disconnected(id_D0_03) && disconnected(id_D1_03) && disconnected(id_D0_11) &&
+            disconnected(id_D1_11))
             return TMG_IGNORE; // LUT with no inputs is a constant
         if (port.in(id_OUT))
             return TMG_COMB_OUTPUT;
         return TMG_IGNORE;
     } else if (cell->type.in(id_CPE_ADDF, id_CPE_ADDF2)) {
-        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_IN5, id_IN6, id_IN7, id_IN8, id_CINX, id_CINY1))
+        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_IN5, id_IN6, id_IN7, id_IN8, id_CINX, id_CINY1, id_D0_00,
+                    id_D1_00, id_D0_01, id_D1_01, id_D0_10, id_D1_10, id_D0_02, id_D1_02, id_D0_03, id_D1_03, id_D0_11,
+                    id_D1_11))
             return TMG_COMB_INPUT;
         if (port.in(id_OUT1, id_OUT2, id_COUTY1))
             return TMG_COMB_OUTPUT;
         return TMG_IGNORE;
     } else if (cell->type.in(id_CPE_MX4)) {
-        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_IN5, id_IN6, id_IN7, id_IN8))
+        if (port.in(id_IN1, id_IN2, id_IN3, id_IN4, id_IN5, id_IN6, id_IN7, id_IN8, id_D0_00, id_D1_00, id_D0_01,
+                    id_D1_01, id_D0_10, id_D1_10, id_D0_02, id_D1_02, id_D0_03, id_D1_03, id_D0_11, id_D1_11))
             return TMG_COMB_INPUT;
         if (port.in(id_OUT1))
             return TMG_COMB_OUTPUT;
@@ -216,7 +243,7 @@ TimingPortClass GateMateImpl::getPortTimingClass(const CellInfo *cell, IdString 
             return TMG_COMB_OUTPUT;
         return TMG_COMB_INPUT;
     } else if (cell->type.in(id_CPE_FF, id_CPE_FF_L, id_CPE_FF_U, id_CPE_LATCH)) {
-        if (port == id_CLK)
+        if (port.in(id_CLK_INT))
             return TMG_CLOCK_INPUT;
         clockInfoCount = 1;
         if (port == id_DOUT)
@@ -299,7 +326,7 @@ TimingPortClass GateMateImpl::getPortTimingClass(const CellInfo *cell, IdString 
         }
         NPNR_ASSERT_FALSE_STR("no timing type for RAM port '" + port.str(ctx) + "'");
     } else {
-        log_error("cell type '%s' is unsupported (instantiated as '%s')\n", cell->type.c_str(ctx),
+        log_error("Cell type '%s' is unsupported (instantiated as '%s').\n", cell->type.c_str(ctx),
                   cell->name.c_str(ctx));
     }
 }
@@ -337,7 +364,7 @@ TimingClockingInfo GateMateImpl::getPortClockingInfo(const CellInfo *cell, IdStr
     if (cell->type.in(id_CPE_FF, id_CPE_FF_L, id_CPE_FF_U, id_CPE_LATCH)) {
         bool inverted = int_or_default(cell->params, id_C_CPE_CLK, 0) == 0b01;
         info.edge = inverted ? FALLING_EDGE : RISING_EDGE;
-        info.clock_port = id_CLK;
+        info.clock_port = id_CLK_INT;
         if (port.in(id_DIN, id_EN, id_SR))
             get_setuphold_from_tmg_db(id_timing_del_Setup_D_L, id_timing_del_Hold_D_L, info.setup, info.hold);
         if (port.in(id_DOUT)) {
@@ -351,34 +378,98 @@ TimingClockingInfo GateMateImpl::getPortClockingInfo(const CellInfo *cell, IdStr
         }
     } else if (cell->type.in(id_RAM, id_RAM_HALF)) {
         std::string name = port.str(ctx);
-        if (boost::starts_with(name, "CLOCK"))
-            get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_1, info.clockToQ);
-        if (boost::starts_with(name, "DOA"))
-            get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_2, info.clockToQ);
-        if (boost::starts_with(name, "DOB"))
-            get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_3, info.clockToQ);
-        if (boost::starts_with(name, "ECC"))
-            get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_4, info.clockToQ);
-        if (boost::starts_with(name, "ADDR"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_1, info.setup, info.hold);
-        if (boost::starts_with(name, "CLOCK1"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_2, info.setup, info.hold);
-        if (boost::starts_with(name, "DIA"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_3, info.setup, info.hold);
-        if (boost::starts_with(name, "DIB"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_4, info.setup, info.hold);
-        if (boost::starts_with(name, "ENA"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_5, info.setup, info.hold);
-        if (boost::starts_with(name, "ENB"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_6, info.setup, info.hold);
-        if (boost::starts_with(name, "GLWEA"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_7, info.setup, info.hold);
-        if (boost::starts_with(name, "GLWEB"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_8, info.setup, info.hold);
-        if (boost::starts_with(name, "WEA"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_9, info.setup, info.hold);
-        if (boost::starts_with(name, "WEB"))
-            get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_10, info.setup, info.hold);
+        int is_ecc_a = int_or_default(cell->params, id_A_ECC_EN, 0);
+        int is_ecc_b = int_or_default(cell->params, id_B_ECC_EN, 0);
+        if (boost::starts_with(name, "CLOCK")) {
+            if (is_ecc_a || is_ecc_b)
+                get_delay_from_tmg_db(id_timing_RAM_ECC_IOPATH_1, info.clockToQ);
+            else
+                get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_1, info.clockToQ);
+        }
+        if (boost::starts_with(name, "DOA")) {
+            if (is_ecc_a)
+                get_delay_from_tmg_db(id_timing_RAM_ECC_IOPATH_2, info.clockToQ);
+            else
+                get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_2, info.clockToQ);
+        }
+        if (boost::starts_with(name, "DOB")) {
+            if (is_ecc_b)
+                get_delay_from_tmg_db(id_timing_RAM_ECC_IOPATH_3, info.clockToQ);
+            else
+                get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_3, info.clockToQ);
+        }
+        if (boost::starts_with(name, "ECC")) {
+            if (is_ecc_a || is_ecc_b)
+                get_delay_from_tmg_db(id_timing_RAM_ECC_IOPATH_4, info.clockToQ);
+            else
+                get_delay_from_tmg_db(id_timing_RAM_NOECC_IOPATH_4, info.clockToQ);
+        }
+        if (boost::starts_with(name, "ADDRA")) {
+            if (is_ecc_a)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_1, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_1, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "ADDRB")) {
+            if (is_ecc_b)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_1, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_1, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "CLOCK1")) { // TODO CLOCK1 || CLOCK2 || CLOCK3 || CLOCK4?
+            if (is_ecc_a || is_ecc_b)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_2, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_2, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "DIA")) {
+            if (is_ecc_a)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_3, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_3, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "DIB")) {
+            if (is_ecc_b)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_4, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_4, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "ENA")) {
+            if (is_ecc_a)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_5, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_5, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "ENB")) {
+            if (is_ecc_b)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_6, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_6, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "GLWEA")) {
+            if (is_ecc_a)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_7, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_7, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "GLWEB")) {
+            if (is_ecc_b)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_8, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_8, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "WEA")) {
+            if (is_ecc_a)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_9, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_9, info.setup, info.hold);
+        }
+        if (boost::starts_with(name, "WEB")) {
+            if (is_ecc_b)
+                get_setuphold_from_tmg_db(id_timing_RAM_ECC_SETUPHOLD_10, info.setup, info.hold);
+            else
+                get_setuphold_from_tmg_db(id_timing_RAM_NOECC_SETUPHOLD_10, info.setup, info.hold);
+        }
         bool is_clk_b = false;
         for (auto c : boost::adaptors::reverse(name)) {
             if (std::isdigit(c) || c == 'X' || c == '[' || c == ']')
@@ -425,7 +516,7 @@ TimingClockingInfo GateMateImpl::getPortClockingInfo(const CellInfo *cell, IdStr
                 break;
             }
         } else {
-            log_error("Uknown clock signal for %s\n", name.c_str());
+            log_error("Unknown clock signal for %s.\n", name.c_str());
         }
     }
 

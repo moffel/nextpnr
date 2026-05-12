@@ -13,6 +13,11 @@ set(SOURCES
     gowin_utils.cc
     gowin_utils.h
     pack.cc
+    pack_bsram.cc
+    pack_dsp.cc
+    pack_luts.cc
+    pack_io.cc
+    pack_iologic.cc
     pack.h
 )
 
@@ -20,7 +25,7 @@ add_nextpnr_himbaechel_microarchitecture(${uarch}
     CORE_SOURCES ${SOURCES}
 )
 
-set(ALL_HIMBAECHEL_GOWIN_DEVICES GW1N-1 GW1NZ-1 GW1N-4 GW1N-9 GW1N-9C GW1NS-4 GW2A-18 GW2A-18C GW5A-25A)
+set(ALL_HIMBAECHEL_GOWIN_DEVICES GW1N-1 GW1NZ-1 GW1N-4 GW1N-9 GW1N-9C GW1NS-4 GW2A-18 GW2A-18C GW5A-25A GW5AST-138C)
 set(HIMBAECHEL_GOWIN_DEVICES ${ALL_HIMBAECHEL_GOWIN_DEVICES} CACHE STRING
     "Include support for these Gowin devices (available: ${ALL_HIMBAECHEL_GOWIN_DEVICES})")
 if (HIMBAECHEL_GOWIN_DEVICES STREQUAL "all")

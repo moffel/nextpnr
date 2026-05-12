@@ -12,6 +12,30 @@
 
 NEXTPNR_NAMESPACE_BEGIN
 
+// Remove [ and ] from port names
+void GowinUtils::remove_brackets(CellInfo *ci)
+{
+    std::vector<IdString> orig_port_names;
+    for (auto &port : ci->ports) {
+        orig_port_names.push_back(port.first);
+    }
+
+    for (auto pname : orig_port_names) {
+        IdString new_name;
+        std::string stripped_name;
+
+        for (auto c : pname.str(ctx)) {
+            if (c != '[' && c != ']') {
+                stripped_name += c;
+            }
+        }
+        new_name = ctx->id(stripped_name);
+        if (new_name != pname) {
+            ci->renamePort(pname, new_name);
+        }
+    }
+}
+
 // clock sources
 bool GowinUtils::driver_is_clksrc(const PortRef &driver)
 {
@@ -344,16 +368,28 @@ IdString GowinUtils::get_bottom_io_wire_b_net(int8_t condition)
     return IdString(extra->bottom_io.conditions[condition].wire_b_net);
 }
 
-bool GowinUtils::has_BANDGAP(void)
+bool GowinUtils::has_BANDGAP(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::HAS_BANDGAP;
 }
 
-bool GowinUtils::has_PINCFG(void)
+bool GowinUtils::has_PINCFG(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::HAS_PINCFG;
+}
+
+bool GowinUtils::need_CFGPINS_INVERSION(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->chip_flags & Extra_chip_data_POD::NEED_CFGPINS_INVERSION;
+}
+
+bool GowinUtils::has_I2CCFG(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->chip_flags & Extra_chip_data_POD::HAS_I2CCFG;
 }
 
 bool GowinUtils::has_DFF67(void) const
@@ -362,58 +398,91 @@ bool GowinUtils::has_DFF67(void) const
     return extra->chip_flags & Extra_chip_data_POD::HAS_DFF67;
 }
 
+bool GowinUtils::has_spine_enable_nets(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->spine_select_wires_top.ssize() || extra->spine_select_wires_bottom.ssize();
+}
+
+bool GowinUtils::get_spine_select_wire(WireId spine, std::vector<std::pair<WireId, int>> &wires)
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+
+    wires.clear();
+    for (auto &rec : wire_in_bottom_half(spine) ? extra->spine_select_wires_bottom : extra->spine_select_wires_top) {
+        if (IdString(rec.spine) == ctx->getWireName(spine)[1]) {
+            IdString tile = ctx->idf("X%dY%d", rec.x, rec.y);
+            IdStringList name = IdStringList::concat(tile, IdString(rec.wire));
+            wires.push_back(std::make_pair(ctx->getWireByName(name), rec.vcc_gnd));
+        }
+    }
+    return !wires.empty();
+}
+
 bool GowinUtils::has_CIN_MUX(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::HAS_CIN_MUX;
 }
 
-bool GowinUtils::has_SP32(void)
+bool GowinUtils::has_SP32(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::HAS_SP32;
 }
 
-bool GowinUtils::need_SP_fix(void)
+bool GowinUtils::need_SP_fix(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::NEED_SP_FIX;
 }
 
-bool GowinUtils::need_SDP_fix(void)
+bool GowinUtils::need_SDP_fix(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::NEED_SDP_FIX;
 }
 
-bool GowinUtils::need_BSRAM_OUTREG_fix(void)
+bool GowinUtils::need_BSRAM_OUTREG_fix(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::NEED_BSRAM_OUTREG_FIX;
 }
 
-bool GowinUtils::need_BSRAM_RESET_fix(void)
+bool GowinUtils::need_BSRAM_DP_CE_fix(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->chip_flags & Extra_chip_data_POD::NEED_BSRAM_DP_CE_FIX;
+}
+
+bool GowinUtils::need_BSRAM_RESET_fix(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::NEED_BSRAM_RESET_FIX;
 }
 
-bool GowinUtils::need_BLKSEL_fix(void)
+bool GowinUtils::need_BLKSEL_fix(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::NEED_BLKSEL_FIX;
 }
 
-bool GowinUtils::has_PLL_HCLK(void)
+bool GowinUtils::has_PLL_HCLK(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::HAS_PLL_HCLK;
 }
 
-bool GowinUtils::has_CLKDIV_HCLK(void)
+bool GowinUtils::has_CLKDIV_HCLK(void) const
 {
     const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
     return extra->chip_flags & Extra_chip_data_POD::HAS_CLKDIV_HCLK;
+}
+
+bool GowinUtils::has_5A_HCLK(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->chip_flags & Extra_chip_data_POD::HAS_5A_HCLK;
 }
 
 IdString GowinUtils::create_aux_name(IdString main_name, int idx, const char *str_suffix)
@@ -429,6 +498,12 @@ std::unique_ptr<CellInfo> GowinUtils::create_cell(IdString name, IdString type)
 }
 
 // DSP
+bool GowinUtils::has_5A_DSP(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->chip_flags & Extra_chip_data_POD::HAS_5A_DSP;
+}
+
 Loc GowinUtils::get_dsp_next_9_in_chain(Loc from) const
 {
     Loc res;
@@ -466,6 +541,20 @@ Loc GowinUtils::get_dsp_next_macro_in_chain(Loc from) const
     return res;
 }
 
+Loc GowinUtils::get_dsp_next_in_chain_5a(Loc from) const
+{
+    Loc res;
+    res.y = from.y;
+    // next DSP
+    int off = 3;
+    if (from.y == get_center_row() && (from.x + 5) == get_center_col()) {
+        off = 9;
+    }
+    res.x = from.x + off;
+    res.z = from.z;
+    return res;
+}
+
 Loc GowinUtils::get_dsp_next_in_chain(Loc from, IdString dsp_type) const
 {
     if (dsp_type.in(id_PADD9, id_PADD18, id_MULT9X9, id_MULT18X18)) {
@@ -473,6 +562,9 @@ Loc GowinUtils::get_dsp_next_in_chain(Loc from, IdString dsp_type) const
     }
     if (dsp_type.in(id_ALU54D, id_MULTALU18X18, id_MULTALU36X18, id_MULTADDALU18X18)) {
         return get_dsp_next_macro_in_chain(from);
+    }
+    if (dsp_type.in(id_MULTADDALU12X12, id_MULTALU27X18)) {
+        return get_dsp_next_in_chain_5a(from);
     }
     NPNR_ASSERT_FALSE("Unknown DSP cell type.");
 }
@@ -483,7 +575,7 @@ CellInfo *GowinUtils::dsp_bus_src(const CellInfo *ci, const char *bus_prefix, in
     CellInfo *connected_to_cell = nullptr;
 
     for (int i = 0; i < wire_num; ++i) {
-        const NetInfo *net = ci->getPort(ctx->idf("%s[%d]", bus_prefix, i));
+        const NetInfo *net = ci->getPort(ctx->idf("%s%d", bus_prefix, i));
         if (connected_to_cell == nullptr) {
             if (net == nullptr || net->driver.cell == nullptr || net->name == ctx->id("$PACKER_VCC") ||
                 net->name == ctx->id("$PACKER_GND")) {
@@ -517,7 +609,7 @@ CellInfo *GowinUtils::dsp_bus_dst(const CellInfo *ci, const char *bus_prefix, in
     CellInfo *connected_to_cell = nullptr;
 
     for (int i = 0; i < wire_num; ++i) {
-        const NetInfo *net = ci->getPort(ctx->idf("%s[%d]", bus_prefix, i));
+        const NetInfo *net = ci->getPort(ctx->idf("%s%d", bus_prefix, i));
         if (connected_to_cell == nullptr) {
             if (net == nullptr || net->users.entries() == 0) {
                 disconnected = true;
@@ -546,6 +638,29 @@ CellInfo *GowinUtils::dsp_bus_dst(const CellInfo *ci, const char *bus_prefix, in
         return nullptr;
     }
     return connected_to_cell;
+}
+
+int GowinUtils::get_hclk_for_io(Loc io_loc) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    for (auto &io_hclk : extra->io_to_hclk) {
+        if (io_hclk.x == io_loc.x && io_hclk.y == io_loc.y) {
+            return io_hclk.hclk_idx;
+        }
+    }
+    return -1;
+}
+
+// Location of clkdiv2 for HCLK
+void GowinUtils::get_clkdiv2_locs(int hclk_idx, std::vector<Loc> &locs)
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    locs.clear();
+    for (auto &hclk_div2 : extra->hclk_div2) {
+        if (hclk_div2.hclk_idx == hclk_idx) {
+            locs.push_back(Loc(hclk_div2.x, hclk_div2.y, hclk_div2.z));
+        }
+    }
 }
 
 // Use the upper CLKDIV as the id for a hclk section
@@ -687,6 +802,18 @@ void GowinUtils::find_connected_bels(const CellInfo *cell, IdString port, IdStri
                 }
         }
     }
+}
+
+// Get spec locations
+int GowinUtils::get_center_row(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->center_row;
+}
+int GowinUtils::get_center_col(void) const
+{
+    const Extra_chip_data_POD *extra = reinterpret_cast<const Extra_chip_data_POD *>(ctx->chip_info->extra_data.get());
+    return extra->center_col;
 }
 
 NEXTPNR_NAMESPACE_END

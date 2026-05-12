@@ -120,6 +120,7 @@ struct XilinxPacker
     void pack_inverters();
     void pack_luts();
     void pack_ffs();
+    bool can_add_ff_to_cluster(const CellInfo *lut, const CellInfo *ff);
     void pack_lutffs();
 
     bool is_constrained(const CellInfo *cell);
@@ -157,8 +158,9 @@ struct XilinxPacker
 
     // Clocking
     BelId find_bel_with_short_route(WireId source, IdString beltype, IdString belpin);
-    void try_preplace(CellInfo *cell, IdString port);
+    bool try_preplace(CellInfo *cell, IdString port);
     void preplace_unique(CellInfo *cell);
+    void generate_constraints();
 
     // Cell creating
     CellInfo *create_cell(IdString type, IdString name);
@@ -201,6 +203,7 @@ struct XC7Packer : public XilinxPacker
     void prepare_clocking();
     void pack_plls();
     void pack_gbs();
+    void preplace_clocking();
     void pack_clocking();
 
     // BRAM
