@@ -30,6 +30,7 @@ struct BaseCtx;
 
 struct IdString
 {
+    std::string_view dbg;
     int index;
 
     static void initialize_arch(const BaseCtx *ctx);
@@ -37,13 +38,11 @@ struct IdString
     static void initialize_add(const BaseCtx *ctx, const char *s, int idx);
 
     constexpr IdString() : index(0) {}
-    explicit constexpr IdString(int index) : index(index) {}
+    explicit constexpr IdString(int index, std::string_view dbg = "") : dbg(dbg), index(index) {}
 
-    void set(const BaseCtx *ctx, const std::string &s);
+    void set(const BaseCtx *ctx, std::string_view s);
 
     IdString(const BaseCtx *ctx, const std::string &s) { set(ctx, s); }
-
-    IdString(const BaseCtx *ctx, const char *s) { set(ctx, s); }
 
     const std::string &str(const BaseCtx *ctx) const;
 
@@ -61,13 +60,8 @@ struct IdString
 
     template <typename... Args> bool in(Args... args) const
     {
-        // Credit: https://articles.emptycrate.com/2016/05/14/folds_in_cpp11_ish.html
-        bool result = false;
-        (void)std::initializer_list<int>{(result = result || in(args), 0)...};
-        return result;
+        return ((args == *this) || ...);
     }
-
-    bool in(const IdString &rhs) const { return *this == rhs; }
 };
 
 NEXTPNR_NAMESPACE_END

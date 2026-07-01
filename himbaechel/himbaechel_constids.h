@@ -49,7 +49,7 @@ enum ConstIds
     ,
 };
 
-#define X(t) static constexpr auto id_##t = IdString(ID_##t);
+#define X(t) static constexpr auto id_##t = IdString(int(ID_##t), #t);
 #include HIMBAECHEL_CONSTIDS
 #undef X
 #endif
