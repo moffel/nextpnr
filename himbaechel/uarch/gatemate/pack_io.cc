@@ -390,7 +390,8 @@ void GateMatePacker::pack_io_sel()
                 cell->disconnectPort(id_CLK);
             } else {
                 if (!uarch->global_signals.count(clk_net)) {
-                    cell->copyPortTo(id_CLK, target, id_OUT4);
+                    IdString usrClkPort = bool_or_default(cell->params, id_OUT1_4) ? id_OUT4 : id_OUT1;
+                    cell->copyPortTo(id_CLK, target, usrClkPort);
                     target->params[id_SEL_OUT_CLOCK] = Property(Property::State::S1);
                     return true;
                 } else {
@@ -418,7 +419,8 @@ void GateMatePacker::pack_io_sel()
                 cell->disconnectPort(id_CLK);
             } else {
                 if (!uarch->global_signals.count(clk_net)) {
-                    cell->movePortTo(id_CLK, target, id_OUT4);
+                    IdString usrClkPort = bool_or_default(cell->params, id_OUT1_4) ? id_OUT4 : id_OUT1;
+                    cell->copyPortTo(id_CLK, target, usrClkPort);
                     target->params[id_SEL_IN_CLOCK] = Property(Property::State::S1);
                 } else {
                     int index = uarch->global_signals[clk_net];
@@ -523,14 +525,14 @@ void GateMatePacker::pack_io_sel()
                         ci.disconnectPort(id_A);
                         dff->copyPortTo(id_D, &ci, id_OUT1);
                         use_custom_clock = set_out_clk(dff, &ci);
-                        bool invert = bool_or_default(dff->params, id_CLK_INV, 0);
+                        bool invert = int_or_default(dff->params, id_C_CPE_CLK) == 1;
                         if (invert) {
                             ci.params[id_INV_OUT1_CLOCK] = Property(Property::State::S1);
                             ci.params[id_INV_OUT2_CLOCK] = Property(Property::State::S1);
                         }
 
                         NetInfo *en_net = dff->getPort(id_EN);
-                        bool en_invert = bool_or_default(dff->params, id_EN_INV, 0);
+                        bool en_invert = int_or_default(dff->params, id_C_CPE_EN) == 1;
                         if ((en_net == net_PACKER_GND && en_invert) || (en_net == net_PACKER_VCC && !en_invert)) {
                             dff->disconnectPort(id_EN);
                             dff->unsetParam(id_EN_INV);
@@ -578,10 +580,11 @@ void GateMatePacker::pack_io_sel()
                     ci.params[id_OUT1_FF] = Property(Property::State::S1);
                     ci.params[id_OUT2_FF] = Property(Property::State::S1);
                     ci.params[id_USE_DDR] = Property(Property::State::S1);
+                    ci.params[id_OUT1_4] = Property(Property::State::S1);
                     packed_cells.emplace(oddr->name);
                     ci.disconnectPort(id_A);
                     oddr->movePortTo(id_D0, &ci, id_OUT2);
-                    oddr->movePortTo(id_D1, &ci, id_OUT1);
+                    oddr->movePortTo(id_D1, &ci, id_OUT4);
                     const auto &pad = uarch->bel_to_pad[ci.bel];
                     int die = uarch->tile_extra_data(ci.bel.tile)->die;
                     auto [cpe_half, cpe_ramio] = ddr[die][pad->pad_bank];
@@ -627,15 +630,139 @@ void GateMatePacker::pack_io_sel()
 
         Loc root_loc = ctx->getBelLocation(ci.bel);
         for (int i = 0; i < 4; i++) {
-            CellInfo *cpe = move_ram_o_fixed(&ci, ctx->idf("OUT%d", i + 1), root_loc).first;
+            auto [cpe, ramo] = move_ram_o_fixed(&ci, ctx->idf("OUT%d", i + 1), root_loc);
             if (cpe && is_inverted[i]) {
                 uint8_t existing = int_or_default(cpe->params, id_INIT_L10, 0);
                 uint8_t inverted = (existing ^ 0xF);
                 cpe->params[id_INIT_L10] = Property(inverted, 4);
             }
+
+            if (cpe && ramo) {
+                if (i == 0 || i == 1 || i == 3)
+                    place_cpe_obuf_ff(&ci, cpe, ramo, i);
+                else if (i == 2)
+                    place_cpe_buf_en_ff(&ci, cpe, ramo);
+            }
         }
     }
     flush_cells();
+}
+
+void GateMatePacker::place_cpe_obuf_ff(CellInfo *iosel, CellInfo *cpe, CellInfo *ramo, int outIdx) {
+    IdString paramName = outIdx == 1 ? id_OUT2_FF : id_OUT1_FF;
+    if (int_or_default(iosel->params, paramName) == 0)
+        return;
+
+    IdString clkInvParam = outIdx == 1 ? id_INV_OUT2_CLOCK : id_INV_OUT1_CLOCK;
+    bool clkInv = bool_or_default(iosel->params, clkInvParam);
+
+    // deactivate io internal ff
+    iosel->params[paramName] = Property(Property::State::S0);
+
+    CellInfo *dff = ctx->createCell(ctx->idf("%s$ffout%i", iosel->name.c_str(ctx), outIdx + 1), id_CPE_FF);
+    dff->params[id_C_CPE_CLK] = Property(clkInv ? 0b01 : 0b10, 2);
+    dff->params[id_C_CPE_EN] = Property(0b11, 2);
+    dff->params[id_C_CPE_RES] = Property(0b11, 2);
+    dff->params[id_C_CPE_SET] = Property(0b11, 2);
+    //dff->params[id_FF_INIT] = Property(0b10, 2);
+
+    dff->addOutput(id_DOUT);
+    dff->addInput(id_DIN);
+    dff->addInput(id_CLK_INT);  
+    if (int_or_default(iosel->params, id_SEL_OUT_CLOCK, 0) != 0) {
+        // user selected clock got connected to OUT1
+        iosel->copyPortTo(id_OUT1, dff, id_CLK_INT);
+    } else {
+        int clkIdx = int_or_default(iosel->params, id_OUT_CLOCK);
+        iosel->copyPortTo(ctx->idf("CLOCK%d", clkIdx + 1), dff, id_CLK_INT);
+    }
+    
+    cpe->connectPorts(id_OUT, dff, id_DIN);
+
+    ramo->disconnectPort(id_I);
+    dff->connectPorts(id_DOUT, ramo, id_I);
+
+    Loc ioloc = iosel->getLocation();
+    Loc roloc = ramo->getLocation();
+    Loc ffloc{roloc.x, roloc.y, roloc.z - 2};
+
+    //if (clkInv) {
+    //    // we cannot put pos and neg edge ff in same cpe
+    //    Loc dir{(roloc.x - ioloc.x)/3, (roloc.y - ioloc.y)/3, 0};
+    //    ffloc.x += dir.x;
+    //    ffloc.y += dir.y;
+    //
+    //    // move ramo cpe to ff cpe
+    //    BelId cpebel = cpe->bel;
+    //    Loc cpeloc = ffloc;
+    //    cpeloc.z -= 2;
+    //    ctx->unbindBel(cpe->bel);
+    //    ctx->bindBel(ctx->getBelByLocation(cpeloc), cpe, PlaceStrength::STRENGTH_FIXED);
+    //
+    //    // we need pass through l2t4
+    //    CellInfo *ptcpe = create_cell_ptr(id_CPE_L2T4, ctx->idf("%s$oddr_ptcpe", iosel->name.c_str(ctx)));
+    //    ptcpe->params[id_INIT_L10] = Property(LUT_D0, 4);
+    //    ramo->disconnectPort(id_I);
+    //    ptcpe->connectPorts(id_OUT, ramo, id_I);
+    //    ptcpe->addInput(id_D0_10);
+    //    dff->connectPorts(id_DOUT, ptcpe, id_D0_10);
+    //    ctx->bindBel(cpebel, ptcpe, PlaceStrength::STRENGTH_FIXED);
+    //}
+    ctx->bindBel(ctx->getBelByLocation(ffloc), dff, PlaceStrength::STRENGTH_FIXED);
+
+    log_warning("placed ff\n");
+}
+
+void GateMatePacker::place_cpe_buf_en_ff(CellInfo *iosel, CellInfo *cpe, CellInfo *ramo) {
+    NetInfo *cpeIn = cpe->getPort(id_D0_10);
+    if (!cpeIn || cpe->type != id_CPE_L2T4) {
+        log_warning("io en %s indentity fail\n", iosel->name.c_str(ctx));
+        return;
+    }
+    size_t numInputs = 0;
+    for (auto &it : cpe->ports)
+        if (it.second.type == PortType::PORT_IN && it.second.net)
+            numInputs++;
+    if (numInputs != 1) {
+        log_warning("io en %s not lut1 fail (%s)\n", iosel->name.c_str(ctx), cpeIn->driver.cell->type.c_str(ctx));
+        return;
+    }
+
+    if (!cpeIn->driver.cell || cpeIn->driver.cell->type != id_CC_DFF) {
+        log_warning("io en %s dff input fail (%s)\n", iosel->name.c_str(ctx), cpeIn->driver.cell->type.c_str(ctx));
+        return;
+    }
+
+    CellInfo *org = cpeIn->driver.cell;
+    CellInfo *dff = ctx->createCell(ctx->idf("%s$ffout%i", iosel->name.c_str(ctx), 3), org->type);
+    dff->params = org->params;
+    for (auto &p : org->ports) 
+        if (p.second.type == PORT_IN)
+            org->copyPortTo(p.first, dff, p.first);
+    
+    dff->disconnectPort(id_D);
+    cpe->connectPorts(id_OUT, dff, id_D);
+
+    dff->addOutput(id_Q);
+    ramo->disconnectPort(id_I);
+    dff->connectPorts(id_Q, ramo, id_I);
+
+    // this is strange. the input is CC_DFF but has all the CPE_FF params.
+//    dff_to_cpe(dff);
+    dff->type = id_CPE_FF;
+    dff->renamePort(id_D, id_DIN);
+    dff->renamePort(id_Q, id_DOUT);
+    dff->renamePort(id_CLK, id_CLK_INT);
+    dff->renamePort(id_EN, id_EN_INT);
+
+    Loc ffLoc = cpe->getLocation();
+    ffLoc.z += 2;
+    ctx->bindBel(ctx->getBelByLocation(ffLoc), dff, PlaceStrength::STRENGTH_FIXED);
+
+    cpe->disconnectPort(id_D0_10);
+    org->copyPortTo(id_D, cpe, id_D0_10);
+
+    log_info("place IO enable FF for %s\n", iosel->name.c_str(ctx));
 }
 
 bool GateMatePacker::is_gpio_out_valid_dff(CellInfo *dff)
