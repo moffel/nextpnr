@@ -24,15 +24,17 @@
 
 NEXTPNR_NAMESPACE_BEGIN
 
-void IdString::set(const BaseCtx *ctx, const std::string &s)
+void IdString::set(const BaseCtx *ctx, std::string_view s)
 {
-    auto it = ctx->idstring_str_to_idx->find(s);
+    auto it = ctx->idstring_str_to_idx->find(std::string{s});
     if (it == ctx->idstring_str_to_idx->end()) {
         index = ctx->idstring_idx_to_str->size();
-        auto insert_rc = ctx->idstring_str_to_idx->insert({s, index});
+        auto insert_rc = ctx->idstring_str_to_idx->insert({std::string{s}, index});
         ctx->idstring_idx_to_str->push_back(&insert_rc.first->first);
+        dbg = insert_rc.first->first;
     } else {
         index = it->second;
+        dbg = it->first;
     }
 }
 
