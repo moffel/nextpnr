@@ -117,6 +117,9 @@ struct GateMatePacker
     bool is_gpio_in_valid_dff(CellInfo *dff);
     bool are_ffs_compatible(CellInfo *dff, CellInfo *other);
 
+    void place_cpe_obuf_ff(CellInfo *iosel, CellInfo *cpe, CellInfo *ramo, int outIdx);
+    void place_cpe_buf_en_ff(CellInfo *iosel, CellInfo *cpe, CellInfo *ramo);
+
     // Cell creating
     CellInfo *create_cell_ptr(IdString type, IdString name);
     void flush_cells();
