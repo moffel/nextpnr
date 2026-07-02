@@ -430,6 +430,13 @@ void GateMatePacker::pack_cpe()
         lt->connectPort(id_OUT, conn);
         ci.addInput(id_DIN);
         ci.connectPort(id_DIN, conn);
+
+        if (ci.bel != BelId())
+        {
+            Loc l = ci.getLocation();
+            l.z -= 2;
+            ctx->bindBel(ctx->getBelByLocation(l), lt, ci.belStrength);
+        }
     }
     dff_list.clear();
 }

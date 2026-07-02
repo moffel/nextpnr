@@ -440,28 +440,16 @@ void GateMatePacker::pack_io_sel()
 
     auto merge_ibf = [&](NetInfo *di_net, CellInfo &ci, bool use_custom_clock) -> bool {
         CellInfo *dff = (*di_net->users.begin()).cell;
-        if (is_gpio_in_valid_dff(dff)) {
-            if (!uarch->global_signals.count(ci.getPort(id_CLK)) && use_custom_clock) {
-                log_warning("Found DFF %s cell, but not enough CLK signals.\n", dff->name.c_str(ctx));
-                return false;
-            }
-            // We configure both GPIO IN and let router decide
-            ci.params[id_IN1_FF] = Property(Property::State::S1);
-            ci.params[id_IN2_FF] = Property(Property::State::S1);
-            packed_cells.emplace(dff->name);
-            ci.disconnectPort(id_Y);
-            dff->movePortTo(id_Q, &ci, id_IN1);
-            set_in_clk(dff, &ci);
-            bool invert = bool_or_default(dff->params, id_CLK_INV, 0);
-            if (invert) {
-                ci.params[id_INV_IN1_CLOCK] = Property(Property::State::S1);
-                ci.params[id_INV_IN2_CLOCK] = Property(Property::State::S1);
-            }
-            return true;
-        } else {
-            log_warning("DFF '%s' cell for IO '%s', but unable to merge.\n", dff->name.c_str(ctx), ci.name.c_str(ctx));
-        }
-        return false;
+        is_gpio_in_valid_dff(dff); // has side effects
+
+        Loc ioloc = ci.getLocation();
+        Loc roloc = uarch->getRelativeConstraint(ioloc, id_OUT1);
+        Loc dir{(roloc.x - ioloc.x) / 3, (roloc.y - ioloc.y) / 3, 0};
+        Loc ffloc{roloc.x + dir.x, roloc.y + dir.y, 3};
+        ctx->bindBel(ctx->getBelByLocation(ffloc), dff, PlaceStrength::STRENGTH_FIXED);
+
+        ci.renamePort(id_Y, id_IN1);
+        return true;
     };
 
     auto merge_iddr = [&](NetInfo *di_net, CellInfo &ci, bool use_custom_clock) -> bool {
@@ -471,20 +459,33 @@ void GateMatePacker::pack_io_sel()
             return false;
         }
 
-        ci.params[id_IN1_FF] = Property(Property::State::S1);
-        ci.params[id_IN2_FF] = Property(Property::State::S1);
+        ci.params[id_IN1_FF] = Property(Property::State::S0);
+        ci.params[id_IN2_FF] = Property(Property::State::S0);
         packed_cells.emplace(iddr->name);
-        ci.disconnectPort(id_Y);
 
-        iddr->movePortTo(id_Q0, &ci, id_IN1);
-        iddr->movePortTo(id_Q1, &ci, id_IN2);
+        ci.renamePort(id_Y, id_IN1);
 
-        set_in_clk(iddr, &ci);
-        bool invert = bool_or_default(iddr->params, id_CLK_INV, 0);
-        if (invert) {
-            ci.params[id_INV_IN1_CLOCK] = Property(Property::State::S1);
-        } else {
-            ci.params[id_INV_IN2_CLOCK] = Property(Property::State::S1);
+        size_t invq = bool_or_default(iddr->params, id_CLK_INV) ? 0 : 1;
+        for (size_t q = 0; q < 2; ++q) {
+            CellInfo *dff = ctx->createCell(ctx->idf("%s$ffin%i", ci.name.c_str(ctx), q), id_CC_DFF);
+            dff->params[id_C_CPE_CLK] = Property(q == invq ? 0b01 : 0b10, 2);
+            dff->params[id_C_CPE_EN] = Property(0b11, 2);
+            dff->params[id_C_CPE_RES] = Property(0b11, 2);
+            dff->params[id_C_CPE_SET] = Property(0b11, 2);
+
+            dff->addOutput(id_Q);
+            dff->addInput(id_D);
+            dff->addInput(id_CLK);
+
+            ci.connectPorts(id_IN1, dff, id_D);
+            iddr->copyPortTo(id_CLK, dff, id_CLK);
+            iddr->movePortTo(q ? id_Q1 : id_Q0, dff, id_Q);
+
+            Loc ioloc = ci.getLocation();
+            Loc roloc = uarch->getRelativeConstraint(ioloc, q ? id_OUT3 : id_OUT1);
+            Loc dir{(roloc.x - ioloc.x)/3, (roloc.y - ioloc.y)/3, 0};
+            Loc ffloc{roloc.x + dir.x, roloc.y + dir.y, 3};
+            ctx->bindBel(ctx->getBelByLocation(ffloc), dff, PlaceStrength::STRENGTH_FIXED);
         }
         return true;
     };
@@ -624,6 +625,8 @@ void GateMatePacker::pack_io_sel()
                 iddr_merged = merge_iddr(di_net, ci, use_custom_clock);
             }
 
+            if(ff_ibf && !ff_ibf_merged && !iddr_merged)
+                log_warning("No suitable FF found for IO IBF_FF packing on '%s'.\n", ci.name.c_str(ctx));
             if (!ff_ibf_merged && !iddr_merged)
                 ci.renamePort(id_Y, id_IN1);
         }
@@ -709,8 +712,6 @@ void GateMatePacker::place_cpe_obuf_ff(CellInfo *iosel, CellInfo *cpe, CellInfo 
     //    ctx->bindBel(cpebel, ptcpe, PlaceStrength::STRENGTH_FIXED);
     //}
     ctx->bindBel(ctx->getBelByLocation(ffloc), dff, PlaceStrength::STRENGTH_FIXED);
-
-    log_warning("placed ff\n");
 }
 
 void GateMatePacker::place_cpe_buf_en_ff(CellInfo *iosel, CellInfo *cpe, CellInfo *ramo) {
@@ -730,6 +731,13 @@ void GateMatePacker::place_cpe_buf_en_ff(CellInfo *iosel, CellInfo *cpe, CellInf
 
     if (!cpeIn->driver.cell || cpeIn->driver.cell->type != id_CC_DFF) {
         log_warning("io en %s dff input fail (%s)\n", iosel->name.c_str(ctx), cpeIn->driver.cell->type.c_str(ctx));
+        return;
+    }
+
+    bool ddrmode = bool_or_default(iosel->params, id_USE_DDR);
+    bool clkinv = int_or_default(cpeIn->driver.cell->params, id_C_CPE_CLK) == 1;
+    if (ddrmode && !clkinv) {
+        log_warning("io en %s dff ddr and positive edge not implemented\n", iosel->name.c_str(ctx));
         return;
     }
 
