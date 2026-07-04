@@ -107,6 +107,10 @@ struct GateMateImpl : HimbaechelAPI
     std::vector<uint32_t> pip_mask;
     int fpga_mode;
     int timing_mode;
+    std::string current_speed_grade;         // speed grade used for place & route
+    std::string fpga_suffix;                 // performance-mode suffix: lpr/eco/spd
+    std::vector<std::string> check_corners;   // extra speed grades to re-time after routing
+    std::string corner_sdf_prefix;            // if set, write <prefix>_<grade>.sdf per corner
     std::map<const NetInfo *, int> global_signals;
     dict<std::pair<IdString, int>, NetInfo *> global_mapping;
     dict<std::pair<IdString, int>, IdString> global_clk_mapping;
@@ -126,6 +130,12 @@ struct GateMateImpl : HimbaechelAPI
                            std::vector<std::pair<CellInfo *, BelId>> &placement) const;
 
     void write_bitstream(const std::string &device, const std::string &filename);
+
+    // Rebuild the `timing` lookup map from the currently selected speed grade.
+    void load_speed_grade_timing();
+    // After routing, re-run timing analysis (and optionally emit SDF) for every
+    // speed grade in `check_corners`, on the identical placed & routed design.
+    void check_timing_corners();
 
     void parse_ccf(const std::string &filename);
 

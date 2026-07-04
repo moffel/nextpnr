@@ -17,6 +17,8 @@
  *
  */
 
+#include <algorithm>
+#include <boost/algorithm/string.hpp>
 #include <utility>
 
 #include "gatemate.h"
@@ -24,6 +26,7 @@
 #include "nextpnr_assertions.h"
 #include "placer_heap.h"
 #include "placer_static.h"
+#include "timing.h"
 
 #define GEN_INIT_CONSTIDS
 #define HIMBAECHEL_CONSTIDS "uarch/gatemate/constids.inc"
@@ -43,6 +46,13 @@ po::options_description GateMateImpl::getUArchOptions()
     specific.add_options()("fpga_mode", po::value<std::string>(),
                            "performance mode (1:lowpower, 2:economy, 3:speed (default))");
     specific.add_options()("time_mode", po::value<std::string>(), "timing mode (1:best, 2:typical, 3:worst (default))");
+    specific.add_options()("timing-corners", po::value<std::string>(),
+                           "after routing, re-run timing analysis for additional corners on the same placed & routed "
+                           "design; value is 'all' or a comma separated list of speed grades. A bare corner such as "
+                           "'best' expands to the current performance mode (e.g. 'best_spd'); a full grade such as "
+                           "'best_eco' is used as-is. Example: --timing-corners best,worst");
+    specific.add_options()("timing-corners-sdf", po::value<std::string>(),
+                           "with --timing-corners, also write one SDF per corner to <prefix>_<grade>.sdf");
     specific.add_options()("strategy", po::value<std::string>(),
                            "multi-die clock placement strategy (mirror (default), full or clk1)");
     specific.add_options()("force_die", po::value<std::string>(), "force specific die (example 1A,1B...)");
@@ -105,19 +115,57 @@ void GateMateImpl::init_database(Arch *arch)
 
     switch (fpga_mode) {
     case 1:
-        speed_grade += "lpr";
+        fpga_suffix = "lpr";
         break;
     case 2:
-        speed_grade += "eco";
+        fpga_suffix = "eco";
         break;
     default:
-        speed_grade += "spd";
+        fpga_suffix = "spd";
     }
+    speed_grade += fpga_suffix;
     log_info("Using performance mode '%s'.\n", fpga_mode == 1   ? "LOWPOWER"
                                                : fpga_mode == 2 ? "ECONOMY"
                                                : fpga_mode == 3 ? "SPEED"
                                                                 : "");
+    current_speed_grade = speed_grade;
     arch->set_speed_grade(speed_grade);
+
+    if (args.options.count("timing-corners")) {
+        auto have_grade = [&](const std::string &g) {
+            for (const auto &sg : arch->chip_info->speed_grades)
+                if (IdString(sg.name) == arch->id(g))
+                    return true;
+            return false;
+        };
+        auto add_grade = [&](std::string g) {
+            // A bare corner (no performance suffix) expands to the current mode.
+            if (g.find('_') == std::string::npos)
+                g += "_" + fpga_suffix;
+            if (!have_grade(g)) {
+                log_warning("Timing corner '%s' not found in database, ignoring.\n", g.c_str());
+                return;
+            }
+            if (std::find(check_corners.begin(), check_corners.end(), g) == check_corners.end())
+                check_corners.push_back(g);
+        };
+        std::string spec = args.options["timing-corners"].as<std::string>();
+        if (spec == "all") {
+            for (const char *pvt : {"best", "typ", "worst"})
+                add_grade(pvt);
+        } else {
+            std::vector<std::string> toks;
+            boost::split(toks, spec, boost::is_any_of(","));
+            for (auto &t : toks) {
+                boost::trim(t);
+                if (!t.empty())
+                    add_grade(t);
+            }
+        }
+    }
+    if (args.options.count("timing-corners-sdf"))
+        corner_sdf_prefix = args.options["timing-corners-sdf"].as<std::string>();
+
     use_cp_for_clk = args.options.count("clk-cp") == 1;
     use_cp_for_cpe = args.options.count("no-cpe-cp") == 0;
     use_bridges = args.options.count("no-bridges") == 0;
@@ -146,10 +194,7 @@ void GateMateImpl::init(Context *ctx)
                               ctx->getBelLocation(bel));
         }
     }
-    const auto &sp = reinterpret_cast<const GateMateSpeedGradeExtraDataPOD *>(ctx->speed_grade->extra_data.get());
-    for (int i = 0; i < sp->timings.ssize(); i++) {
-        timing.emplace(IdString(sp->timings[i].name), &sp->timings[i]);
-    }
+    load_speed_grade_timing();
     for (int num = 0; num < 2; num++) {
         int index = (num == 0) ? 0 : 2;
         ram_signal_clk.emplace(ctx->idf("ENA[%d]", index), RamPinInfo{RamPinKind::CTRL, false, num});
@@ -615,8 +660,55 @@ void GateMateImpl::reassign_cplines(NetInfo *ni, const dict<WireId, PipMap> &net
     }
 }
 
+void GateMateImpl::load_speed_grade_timing()
+{
+    timing.clear();
+    const auto &sp = reinterpret_cast<const GateMateSpeedGradeExtraDataPOD *>(ctx->speed_grade->extra_data.get());
+    for (int i = 0; i < sp->timings.ssize(); i++)
+        timing.emplace(IdString(sp->timings[i].name), &sp->timings[i]);
+}
+
+void GateMateImpl::check_timing_corners()
+{
+    if (check_corners.empty())
+        return;
+
+    // Timing analysis must see the real (non-fast) pip delays; routing runs with
+    // the fast estimate enabled, so switch to accurate delays.
+    ctx->set_fast_pip_delays(false);
+
+    for (const auto &grade : check_corners) {
+        log_info("Analysing timing corner '%s'...\n", grade.c_str());
+        ctx->set_speed_grade(grade);
+        load_speed_grade_timing();
+        // print_path must be true: it is the only flag that makes log_timing_results
+        // actually print Hold/min-delay violations (log_fmax only ever reports setup/Fmax).
+        timing_analysis(ctx, /*slack_histogram=*/false, /*print_fmax=*/true, /*print_path=*/true,
+                        /*warn_on_failure=*/true, /*update_results=*/false);
+        if (!corner_sdf_prefix.empty()) {
+            std::string filename = corner_sdf_prefix + "_" + grade + ".sdf";
+            auto f = open_ofstream_and_log_error(filename, "SDF file");
+            if (f) {
+                ctx->writeSDF(f, false);
+                log_info("Wrote SDF for corner '%s' to '%s'.\n", grade.c_str(), filename.c_str());
+            }
+        }
+    }
+
+    // Restore the speed grade used for place & route so bitstream generation and
+    // any later reporting see the corner the user selected.
+    ctx->set_speed_grade(current_speed_grade);
+    load_speed_grade_timing();
+}
+
 void GateMateImpl::postRoute()
 {
+    // Re-time additional corners while the netlist still has its logical timing
+    // ports (later steps in postRoute rename FF clock/data ports to physical
+    // names, which the timing model no longer recognises). Routing is already
+    // final at this point, so every corner sees the identical implementation.
+    check_timing_corners();
+
     int num = 0;
 
     pool<IdString> nets_with_bridges;
